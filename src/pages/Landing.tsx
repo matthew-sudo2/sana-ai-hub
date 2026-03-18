@@ -81,8 +81,8 @@ const Landing = () => {
             <span className="font-mono text-xs text-muted-foreground">AI-Powered Research Validation</span>
           </div>
           <h1 className="font-display text-4xl font-extrabold leading-tight tracking-tight sm:text-5xl lg:text-6xl">
-            From raw data to{" "}
-            <span className="text-success">verified insights</span>
+            Sana All May{" "}
+            <span className="text-success">Label</span>
           </h1>
           <p className="mx-auto mt-5 max-w-xl font-body text-base leading-relaxed text-muted-foreground sm:text-lg">
             An end-to-end pipeline that scouts, cleans, visualizes, and validates research data — so you can focus on discovery, not data wrangling.
