@@ -1,0 +1,9 @@
+spider_client>=0.0.0
+ollama>=0.3.0
+pydantic>=2.7.0
+python-dotenv>=1.0.1
+pandas>=2.2.0
+numpy>=1.26.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+pillow>=10.4.0

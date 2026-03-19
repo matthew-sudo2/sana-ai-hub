@@ -12,6 +12,12 @@ dist
 dist-ssr
 *.local
 
+# Backend runtime artifacts
+backend/runs
+backend/.env
+backend/__pycache__/
+.sana/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
