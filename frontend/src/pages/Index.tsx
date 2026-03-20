@@ -1,9 +1,11 @@
 import AppSidebar from "@/components/AppSidebar";
 import ProgressTracker from "@/components/ProgressTracker";
 import InputZone from "@/components/InputZone";
+import PhaseStatus from "@/components/PhaseStatus";
 import DataPanel from "@/components/DataPanel";
 import GalleryPanel from "@/components/GalleryPanel";
 import ReportPanel from "@/components/ReportPanel";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 const Index = () => {
   return (
@@ -16,7 +18,7 @@ const Index = () => {
         <header className="flex items-center justify-between border-b px-6 py-3">
           <div>
             <h1 className="font-display text-base font-bold text-foreground">Sana All May Label</h1>
-            <p className="font-body text-[11px] text-muted-foreground">AI Research Validation Pipeline</p>
+            <p className="font-body text-[11px] text-muted-foreground">5-Agent Data Pipeline</p>
           </div>
           <div className="flex items-center gap-3">
             <span className="h-2 w-2 rounded-full bg-success animate-pulse-slow" />
@@ -26,24 +28,39 @@ const Index = () => {
 
         {/* Progress Tracker */}
         <div className="border-b">
-          <ProgressTracker />
+          <ErrorBoundary>
+            <ProgressTracker />
+          </ErrorBoundary>
         </div>
 
         {/* Input Zone */}
         <div className="border-b pt-4">
-          <InputZone />
+          <ErrorBoundary>
+            <InputZone />
+          </ErrorBoundary>
         </div>
+
+        {/* Phase Status */}
+        <ErrorBoundary>
+          <PhaseStatus />
+        </ErrorBoundary>
 
         {/* Three-Panel Layout */}
         <div className="grid flex-1 grid-cols-10 divide-x overflow-hidden">
           <div className="col-span-3 overflow-auto">
-            <DataPanel />
+            <ErrorBoundary>
+              <DataPanel />
+            </ErrorBoundary>
           </div>
           <div className="col-span-4 overflow-auto">
-            <GalleryPanel />
+            <ErrorBoundary>
+              <GalleryPanel />
+            </ErrorBoundary>
           </div>
           <div className="col-span-3 overflow-auto">
-            <ReportPanel />
+            <ErrorBoundary>
+              <ReportPanel />
+            </ErrorBoundary>
           </div>
         </div>
       </div>

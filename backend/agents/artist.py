@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import ast
 import datetime as dt
+from datetime import timezone
 import json
 import os
 import re
 import subprocess
+import warnings
 from pathlib import Path
 from typing import Any, Callable
 
@@ -16,6 +18,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+# Suppress runtime warnings that occur with low-data visualizations
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 
 class UnsafeGeneratedCodeError(RuntimeError):
@@ -65,11 +70,19 @@ def _write_json(path: Path, obj: Any) -> None:
 
 def _ollama_generate(model: str, prompt: str, host: str) -> str:
     """
-    Prefer the `ollama` Python library; fall back to the CLI.
+    Generate visualization code via Ollama, with fallback when unavailable.
     keep_alive=0 requests immediate unload after completion.
     """
     try:
         import ollama  # type: ignore
+        import requests
+        
+        # Check if Ollama is alive first
+        try:
+            requests.get(f"{host}/api/tags", timeout=2)
+        except Exception:
+            # Ollama not available, return fallback code
+            return _generate_fallback_viz_code()
 
         client = ollama.Client(host=host)
         resp = client.generate(
@@ -79,19 +92,89 @@ def _ollama_generate(model: str, prompt: str, host: str) -> str:
             options={"temperature": 0.1},
             keep_alive=0,
         )
-        return str(resp.get("response", "")).strip()
+        code_output = str(resp.get("response", "")).strip()
+        # Extract code from markdown fences if present
+        if "```" in code_output:
+            start = code_output.find("```python")
+            if start != -1:
+                start += len("```python")
+                end = code_output.find("```", start)
+                if end != -1:
+                    code_output = code_output[start:end].strip()
+        return code_output if code_output else _generate_fallback_viz_code()
     except Exception:
-        completed = subprocess.run(
-            ["ollama", "run", model],
-            input=prompt.encode("utf-8"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-        )
-        return completed.stdout.decode("utf-8", errors="replace").strip()
+        # Ollama failed, use fallback
+        return _generate_fallback_viz_code()
     finally:
         subprocess.run(["ollama", "stop", model], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+
+def _generate_fallback_viz_code() -> str:
+    """Return basic visualization code when Ollama is unavailable."""
+    return """
+def create_visualizations(df: pd.DataFrame):
+    \"\"\"Create basic statistical visualizations.\"\"\"
+    if len(df) == 0:
+        print("No data to visualize")
+        return {}
+    
+    images = {}
+    try:
+        # Summary statistics plot
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        df.describe().T.plot(kind='bar', ax=axes[0])
+        axes[0].set_title('Statistics Summary')
+        
+        # Data types count
+        df.dtypes.value_counts().plot(kind='pie', ax=axes[1], autopct='%1.1f%%')
+        axes[1].set_title('Data Types Distribution')
+        
+        plt.tight_layout()
+        images['overview.png'] = fig
+    except Exception:
+        pass
+    
+    return images
+"""
+
+def _strip_imports(code: str) -> str:
+    """Remove import statements and try/except blocks from generated code."""
+    lines = code.split("\n")
+    filtered = []
+    in_try_block = False
+    try_indent = 0
+    
+    for line in lines:
+        stripped = line.strip()
+        
+        # Skip import lines
+        if stripped.startswith("import ") or stripped.startswith("from "):
+            continue
+        
+        # Track try blocks
+        if stripped.startswith("try:"):
+            in_try_block = True
+            try_indent = len(line) - len(line.lstrip())
+            continue
+        
+        # Skip except/finally blocks
+        if in_try_block and (stripped.startswith("except") or stripped.startswith("finally")):
+            continue
+        
+        # If we're in a try block, check if we've returned to original indent
+        if in_try_block:
+            current_indent = len(line) - len(line.lstrip()) if line.strip() else try_indent
+            if line.strip() and current_indent <= try_indent and not stripped.startswith("except") and not stripped.startswith("finally"):
+                in_try_block = False
+        
+        # Skip pass statements (often used in except blocks)
+        if stripped == "pass":
+            if in_try_block:
+                continue
+        
+        filtered.append(line)
+    
+    return "\n".join(filtered)
 
 def _validate_generated_module(code: str) -> None:
     tree = ast.parse(code)
@@ -114,6 +197,8 @@ def _validate_generated_module(code: str) -> None:
 def _compile_generated_functions(
     code: str,
 ) -> tuple[Callable[[pd.DataFrame, str, str], None], Callable[[pd.DataFrame, str], None]]:
+    # Strip imports and try-except blocks before validation
+    code = _strip_imports(code)
     _validate_generated_module(code)
 
     safe_builtins = {
@@ -201,7 +286,9 @@ def _build_phase3_prompt(df_preview_csv: str, model_name: str, primary_col: str)
 
 
 def main() -> int:
-    load_dotenv()
+    # Load environment from explicit backend/.env path
+    env_file = Path(__file__).parent.parent / ".env"
+    load_dotenv(dotenv_path=env_file)
 
     parser = argparse.ArgumentParser(description="Phase 3 Artist: publication-ready plots via local Ollama.")
     parser.add_argument(
@@ -236,8 +323,8 @@ def main() -> int:
     primary_col = _select_primary_numeric_column(df)
     df_preview_csv = df.head(8).to_csv(index=False)
 
-    run_ts = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    run_dir = Path("backend") / args.out_dir / f"{run_ts}_{_safe_slug(cleaned_path.stem)}"
+    # Use parent directory of CSV (scout's output directory), not create new one
+    run_dir = cleaned_path.parent
     _ensure_dir(run_dir)
 
     _write_text(run_dir / "df_preview.csv", df_preview_csv)

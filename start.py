@@ -144,28 +144,73 @@ def ensure_frontend_deps(auto_install: bool) -> None:
 
 
 def start_frontend() -> int:
+    """Start frontend dev server on fixed port 8080."""
     # New process group allows reliable stop via taskkill /T on Windows.
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
     npm_exe = "npm.cmd" if os.name == "nt" and _which("npm.cmd") else "npm"
 
+    # Pass port explicitly to ensure 8080
+    env = os.environ.copy()
+    env["VITE_API_BASE_URL"] = "http://localhost:8000"
+    
     proc = subprocess.Popen(
-        [npm_exe, "run", "dev"],
+        [npm_exe, "run", "dev", "--", "--port", "8080"],
         cwd=str(FRONTEND_DIR),
         creationflags=creationflags,
+        env=env,
     )
     return int(proc.pid)
 
 
-def write_pids(frontend_pid: int) -> None:
+def start_backend() -> int:
+    """Start backend API server on fixed port 8000."""
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+
+    # Load environment variables
+    env = os.environ.copy()
+    for env_name in (".env", ".env.example"):
+        env_path = BACKEND_DIR / env_name
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k:
+                    env[k] = v
+
+    # Use venv Python executable if available, otherwise fall back to sys.executable
+    python_exe = ROOT / ".venv" / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
+    if not python_exe.exists():
+        python_exe = Path(sys.executable)
+
+    proc = subprocess.Popen(
+        [str(python_exe), "-m", "uvicorn", "backend.api:app", "--host", "127.0.0.1", "--port", "8000"],
+        cwd=str(ROOT),
+        creationflags=creationflags,
+        env=env,
+    )
+    return int(proc.pid)
+
+
+def write_pids(frontend_pid: int, backend_pid: int) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"frontend_pid": frontend_pid, "started_at_unix": int(time.time())}
+    payload = {
+        "frontend_pid": frontend_pid,
+        "backend_pid": backend_pid,
+        "started_at_unix": int(time.time())
+    }
     PIDS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Start Sana All May Label (preflight + frontend).")
+    parser = argparse.ArgumentParser(description="Start Sana All May Label (preflight + backend + frontend).")
     parser.add_argument(
         "--no-install",
         action="store_true",
@@ -178,6 +223,34 @@ def main() -> int:
         raise RuntimeError("Missing ./frontend directory.")
     if not BACKEND_DIR.exists():
         raise RuntimeError("Missing ./backend directory.")
+
+    # Kill any existing processes on ports 8000-8090 first
+    print("[startup] Cleaning up any existing processes...")
+    for port in range(8000, 8091):
+        try:
+            result = subprocess.run(
+                f'netstat -ano | findstr ":{port}"' if os.name == "nt" else f"lsof -i :{port}",
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if result.stdout:
+                try:
+                    parts = result.stdout.split()
+                    pid = int(parts[-1]) if parts else 0
+                    if pid > 0:
+                        subprocess.run(
+                            ["taskkill", "/PID", str(pid), "/T", "/F"] if os.name == "nt" else ["kill", "-9", str(pid)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    
+    time.sleep(1)  # Wait for ports to be released
 
     # Load backend/.env so model names + keys are visible to this process.
     _load_backend_env_into_process()
@@ -216,9 +289,21 @@ def main() -> int:
 
     ensure_frontend_deps(auto_install=not args.no_install)
 
+    # Start backend first (it's a dependency for frontend)
+    print("[startup] Starting backend API on localhost:8000...")
+    backend_pid = start_backend()
+    time.sleep(2)  # Give backend time to start
+    print(f"[ok] Backend started (pid={backend_pid}) on http://localhost:8000")
+
+    # Start frontend
+    print("[startup] Starting frontend on localhost:8080...")
     frontend_pid = start_frontend()
-    write_pids(frontend_pid)
-    print(f"[ok] Frontend started (pid={frontend_pid}). To stop: python stop.py")
+    time.sleep(2)  # Give frontend time to start
+    print(f"[ok] Frontend started (pid={frontend_pid}) on http://localhost:8080")
+    
+    write_pids(frontend_pid, backend_pid)
+    print("[ok] All services running. To stop: python stop.py")
+    print(f"[ok] Dashboard: http://localhost:8080/dashboard")
     return 0
 
 

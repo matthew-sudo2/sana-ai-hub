@@ -1,0 +1,13 @@
+{
+  "source_url": "https://example.com",
+  "publication_date": null,
+  "primary_topic": "Domain Information",
+  "raw_quantitative_stats": {
+    "ai_cost": 0.0,
+    "bytes_transferred_cost": 4.3665e-07,
+    "compute_cost": 1.0333333333333335e-07,
+    "file_cost": 7.92e-07,
+    "transform_cost": 1e-05,
+    "total_cost": 1.1331983333333334e-05
+  }
+}

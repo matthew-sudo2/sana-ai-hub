@@ -1,186 +1,646 @@
+"""
+Scout Agent — Phase 1
+Identifies and acquires usable datasets from URLs or uploaded files.
+
+Responsibilities:
+  1. URL Evaluation     – trusted-source check + dataset-content detection
+  2. Content Fetching   – HTML / file download, strips UI noise
+  3. Data Structure Discovery – tables, rows, columns, dtype inference
+  4. Schema Validation  – consistency, size heuristics, optional LLM confirmation
+  5. File Handling      – CSV / XLSX / JSON uploads bypass web scraping
+  6. Output             – structured JSON ready for downstream agents
+"""
+
 from __future__ import annotations
 
-import argparse
-import datetime as dt
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field, ValidationError
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field
 
+# ---------------------------------------------------------------------------
+# Output schema
+# ---------------------------------------------------------------------------
 
-class ExtractedMetadata(BaseModel):
-    source_url: str = Field(min_length=1)
-    publication_date: Optional[str] = None
-    primary_topic: str = Field(min_length=1)
-    raw_quantitative_stats: Any
-
-
-def _require_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
-
-
-def _safe_slug(text: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", text).strip("_")
-    return slug[:80] or "run"
-
-
-def _ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def _write_text(path: Path, content: str) -> None:
-    path.write_text(content, encoding="utf-8")
-
-
-def _write_json(path: Path, obj: Any) -> None:
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def crawl_with_spider(source_url: str, limit: int = 5, return_format: str = "markdown") -> Any:
-    """
-    Uses the `spider_client` package's API surface shown in the user's snippet:
-      # pip install spider_client
-      from spider import Spider
-      app = Spider(api_key=...)
-      result = app.crawl_url(url, params={...})
-    """
-    spider_api_key = _require_env("SPIDER_API_KEY")
-
-    try:
-        from spider import Spider  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "Failed to import Spider client. Ensure you installed `spider_client` "
-            "into your current Python environment."
-        ) from e
-
-    app = Spider(api_key=spider_api_key)
-    result = app.crawl_url(
-        source_url,
-        params={"limit": int(limit), "return_format": str(return_format)},
+class ScoutResult(BaseModel):
+    is_dataset: bool
+    source: str
+    source_type: str                        # "url" | "csv" | "xlsx" | "json" | "text"
+    columns: list[str] = Field(default_factory=list)
+    dtypes: dict[str, str] = Field(default_factory=dict)
+    num_rows: int = 0
+    num_columns: int = 0
+    sample_data: list[dict[str, Any]] = Field(default_factory=list)
+    confidence_score: float = 0.0           # 0.0 – 1.0
+    rejection_reason: Optional[str] = None
+    tables_found: int = 0
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
-    return result
+
+# ---------------------------------------------------------------------------
+# Constants / configuration
+# ---------------------------------------------------------------------------
+
+TRUSTED_DOMAINS: set[str] = {
+    # Government / statistical
+    "data.gov", "data.gov.ph", "census.gov", "bls.gov", "data.worldbank.org",
+    "stats.oecd.org", "data.un.org", "eurostat.ec.europa.eu",
+    # Research / academic
+    "kaggle.com", "huggingface.co", "zenodo.org", "figshare.com",
+    "datadryad.org", "osf.io", "ncbi.nlm.nih.gov", "ourworldindata.org",
+    # Open data portals
+    "opendata.ph", "data.cityofnewyork.us", "data.london.gov.uk",
+    "data.medicare.gov", "healthdata.gov",
+    # Raw / repo hosts
+    "raw.githubusercontent.com", "github.com", "gitlab.com",
+    # Common dataset hubs
+    "archive.ics.uci.edu", "datasetsearch.research.google.com",
+}
+
+DATASET_EXTENSIONS = {".csv", ".xlsx", ".xls", ".json", ".tsv", ".parquet"}
+
+MIN_ROWS = 3
+MIN_COLS = 2
+FETCH_TIMEOUT = 20  # seconds
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; ScoutAgent/1.0; +https://github.com/scout-agent)"
+    )
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _domain(url: str) -> str:
+    """Return the registered domain of a URL (strips www.)."""
+    host = urlparse(url).netloc.lower()
+    return host.removeprefix("www.")
 
 
-def _json_from_text(text: str) -> dict[str, Any]:
-    """
-    Robust JSON extraction for LLM outputs:
-    - Prefer full-string JSON
-    - Otherwise try to extract the first {...} block
-    """
-    text = text.strip()
+def _is_trusted(url: str) -> bool:
+    host = _domain(url)
+    if any(host == d or host.endswith("." + d) for d in TRUSTED_DOMAINS):
+        return True
+    # Not in allow-list — still proceed but lower confidence
+    return False
+
+
+def _ext(url: str) -> str:
+    path = urlparse(url).path
+    return Path(path).suffix.lower()
+
+
+def _dtype_name(series: pd.Series) -> str:
+    kind = series.dtype.kind
+    mapping = {"i": "integer", "u": "integer", "f": "float",
+                "M": "datetime", "b": "boolean"}
+    return mapping.get(kind, "categorical")
+
+
+def _summarise_df(df: pd.DataFrame, source: str, source_type: str,
+                  confidence: float, tables_found: int = 1) -> ScoutResult:
+    """Convert a DataFrame into a ScoutResult."""
+    if df.empty or len(df) < MIN_ROWS or len(df.columns) < MIN_COLS:
+        return ScoutResult(
+            is_dataset=False,
+            source=source,
+            source_type=source_type,
+            rejection_reason=(
+                f"Table too small: {len(df)} row(s), {len(df.columns)} column(s). "
+                f"Minimum required: {MIN_ROWS} rows × {MIN_COLS} columns."
+            ),
+            tables_found=tables_found,
+        )
+
+    # Infer better dtypes
+    df = df.infer_objects()
+    for col in df.select_dtypes(include="object"):
+        try:
+            df[col] = pd.to_datetime(df[col], infer_datetime_format=True)
+        except Exception:
+            try:
+                df[col] = pd.to_numeric(df[col])
+            except Exception:
+                pass
+
+    columns = list(df.columns.astype(str))
+    dtypes = {col: _dtype_name(df[col]) for col in df.columns}
+    sample = df.head(5).astype(str).to_dict(orient="records")
+
+    return ScoutResult(
+        is_dataset=True,
+        source=source,
+        source_type=source_type,
+        columns=columns,
+        dtypes=dtypes,
+        num_rows=len(df),
+        num_columns=len(columns),
+        sample_data=sample,
+        confidence_score=round(confidence, 2),
+        tables_found=tables_found,
+    )
+
+# ---------------------------------------------------------------------------
+# LLM confirmation (Ollama, optional)
+# ---------------------------------------------------------------------------
+
+def _check_ollama(host: str) -> bool:
     try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
+        r = requests.get(f"{host}/api/tags", timeout=2)
+        return r.status_code == 200
     except Exception:
-        pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = text[start : end + 1]
-        obj = json.loads(candidate)
-        if isinstance(obj, dict):
-            return obj
-
-    raise ValueError("Model output was not valid JSON.")
+        return False
 
 
-def extract_entities_with_ollama(source_url: str, crawled_payload: Any) -> ExtractedMetadata:
-    ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").strip()
-    model = os.getenv("OLLAMA_MODEL", "llama3.2:3b").strip()
+def _llm_confirm_dataset(snippet: str, ollama_host: str, model: str) -> tuple[bool, float, str]:
+    """
+    Ask a local LLM whether the snippet looks like dataset content.
+    Returns (is_dataset, confidence 0-1, reason).
+    Falls back to (True, 0.5, "llm_unavailable") gracefully.
+    """
+    if not _check_ollama(ollama_host):
+        return True, 0.5, "llm_unavailable"
 
     prompt = (
-        "You are an information extraction system.\n"
-        "Task: Extract relevant metadata from the provided crawled web content.\n"
-        "Return STRICT JSON ONLY (no markdown, no commentary).\n\n"
-        "Required JSON keys:\n"
-        '- "source_url": string (must equal the provided URL)\n'
-        '- "publication_date": string or null (ISO 8601 preferred if available)\n'
-        '- "primary_topic": string (concise)\n'
-        '- "raw_quantitative_stats": object or array (numbers and units as found; do not invent)\n\n'
-        f"Provided source_url: {source_url}\n\n"
-        "Crawled content (may be markdown/HTML or structured):\n"
-        f"{crawled_payload}\n"
+        "You are a data quality classifier.\n"
+        "Determine if the following content is a structured dataset "
+        "(tables, repeated rows, CSV-like structures, JSON arrays of records).\n"
+        "Reply ONLY with a JSON object containing:\n"
+        '  "is_dataset": true or false\n'
+        '  "confidence": float 0.0-1.0\n'
+        '  "reason": one short sentence\n\n'
+        f"Content snippet:\n{snippet[:1500]}\n"
     )
 
-    # Prefer the official Python client; fall back to the CLI if needed.
-    # Sequential Loading: keep single call and explicitly request unload after.
-    text_out: str
     try:
         import ollama  # type: ignore
-
         client = ollama.Client(host=ollama_host)
-        resp = client.generate(
-            model=model,
-            prompt=prompt,
-            stream=False,
-            options={"temperature": 0.1},
-            keep_alive=0,
-        )
-        text_out = str(resp.get("response", "")).strip()
+        resp = client.generate(model=model, prompt=prompt, stream=False,
+                               options={"temperature": 0.0}, keep_alive=0)
+        text = str(resp.get("response", "")).strip()
     except Exception:
-        completed = subprocess.run(
-            ["ollama", "run", model],
-            input=prompt.encode("utf-8"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-        )
-        text_out = completed.stdout.decode("utf-8", errors="replace").strip()
+        try:
+            completed = subprocess.run(
+                ["ollama", "run", model],
+                input=prompt.encode(),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=25, check=True,
+            )
+            text = completed.stdout.decode(errors="replace").strip()
+        except Exception:
+            return True, 0.5, "llm_unavailable"
 
+    # Parse JSON from response
     try:
-        obj = _json_from_text(text_out)
-        obj["source_url"] = source_url
-        extracted = ExtractedMetadata.model_validate(obj)
-        return extracted
-    except (ValueError, ValidationError) as e:
-        raise RuntimeError(f"Entity extraction failed: {e}") from e
-    finally:
-        # Best-effort explicit unload to free VRAM for the next phase.
-        subprocess.run(["ollama", "stop", model], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        start, end = text.find("{"), text.rfind("}")
+        obj = json.loads(text[start:end + 1])
+        return bool(obj.get("is_dataset", True)), float(obj.get("confidence", 0.5)), str(obj.get("reason", ""))
+    except Exception:
+        return True, 0.5, "llm_parse_error"
 
+# ---------------------------------------------------------------------------
+# File handlers
+# ---------------------------------------------------------------------------
+
+def _load_csv(path_or_bytes: "str | Path | bytes", source: str) -> ScoutResult:
+    try:
+        if isinstance(path_or_bytes, bytes):
+            df = pd.read_csv(io.BytesIO(path_or_bytes))
+        else:
+            df = pd.read_csv(path_or_bytes)
+        return _summarise_df(df, source, "csv", confidence=0.95)
+    except Exception as e:
+        return ScoutResult(is_dataset=False, source=source, source_type="csv",
+                           rejection_reason=f"CSV parse error: {e}")
+
+
+def _load_excel(path_or_bytes: "str | Path | bytes", source: str) -> ScoutResult:
+    try:
+        if isinstance(path_or_bytes, bytes):
+            df = pd.read_excel(io.BytesIO(path_or_bytes))
+        else:
+            df = pd.read_excel(path_or_bytes)
+        return _summarise_df(df, source, "xlsx", confidence=0.95)
+    except Exception as e:
+        return ScoutResult(is_dataset=False, source=source, source_type="xlsx",
+                           rejection_reason=f"Excel parse error: {e}")
+
+
+def _load_json(path_or_bytes: "str | Path | bytes", source: str) -> ScoutResult:
+    try:
+        if isinstance(path_or_bytes, bytes):
+            raw = json.loads(path_or_bytes.decode())
+        else:
+            raw = json.loads(Path(path_or_bytes).read_text(encoding="utf-8"))
+
+        # Accept list-of-dicts or dict-with-records key
+        if isinstance(raw, list):
+            df = pd.json_normalize(raw)
+        elif isinstance(raw, dict):
+            # Try to find a key that holds a list
+            list_key = next((k for k, v in raw.items() if isinstance(v, list)), None)
+            if list_key:
+                df = pd.json_normalize(raw[list_key])
+            else:
+                df = pd.json_normalize([raw])
+        else:
+            return ScoutResult(is_dataset=False, source=source, source_type="json",
+                               rejection_reason="JSON root is neither a list nor a dict.")
+        return _summarise_df(df, source, "json", confidence=0.90)
+    except Exception as e:
+        return ScoutResult(is_dataset=False, source=source, source_type="json",
+                           rejection_reason=f"JSON parse error: {e}")
+
+# ---------------------------------------------------------------------------
+# URL handler
+# ---------------------------------------------------------------------------
+
+def _fetch_url(url: str) -> tuple[bytes, str]:
+    """Fetch URL content; returns (raw_bytes, content_type)."""
+    r = requests.get(url, headers=HEADERS, timeout=FETCH_TIMEOUT, stream=True)
+    r.raise_for_status()
+    content_type = r.headers.get("Content-Type", "").lower()
+    return r.content, content_type
+
+
+def _score_html_table(df: pd.DataFrame) -> float:
+    """Heuristic confidence for an HTML-extracted table."""
+    score = 0.5
+    if len(df) >= 10:
+        score += 0.15
+    if len(df) >= 50:
+        score += 0.10
+    if len(df.columns) >= 4:
+        score += 0.10
+    numeric_cols = df.select_dtypes(include="number").shape[1]
+    if numeric_cols >= 2:
+        score += 0.10
+    # Penalise tables that look like navigation / layout
+    col_names = " ".join(df.columns.astype(str)).lower()
+    if any(w in col_names for w in ("button", "action", "link", "nav", "menu")):
+        score -= 0.20
+    return min(max(score, 0.0), 1.0)
+
+
+def _html_to_best_df(html: str) -> tuple[pd.DataFrame | None, int]:
+    """
+    Parse HTML, strip noise, find all tables, return the best one.
+    Returns (best_df | None, total_tables_found).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Remove noise elements
+    for tag in soup.find_all(["script", "style", "nav", "footer", "header",
+                               "aside", "form", "button", "iframe", "noscript",
+                               "svg", "figure", "figcaption"]):
+        tag.decompose()
+
+    # Attempt 1: pandas read_html (fastest)
+    try:
+        tables = pd.read_html(io.StringIO(str(soup)), flavor="bs4")
+    except Exception:
+        tables = []
+
+    if not tables:
+        return None, 0
+
+    # Filter out tiny tables
+    candidates = [t for t in tables if len(t) >= MIN_ROWS and len(t.columns) >= MIN_COLS]
+    if not candidates:
+        return None, len(tables)
+
+    # Pick table with the best heuristic score
+    best = max(candidates, key=_score_html_table)
+    return best, len(tables)
+
+
+def _scout_url(url: str, use_llm: bool = False,
+               ollama_host: str = "http://127.0.0.1:11434",
+               ollama_model: str = "llama3.2:3b") -> ScoutResult:
+    """Full pipeline for URL-sourced data."""
+
+    trusted = _is_trusted(url)
+    extension = _ext(url)
+
+    # ---- Direct file download ----
+    if extension in DATASET_EXTENSIONS:
+        try:
+            raw, _ = _fetch_url(url)
+        except Exception as e:
+            return ScoutResult(is_dataset=False, source=url, source_type="url",
+                               rejection_reason=f"Download failed: {e}")
+
+        if extension == ".csv":
+            result = _load_csv(raw, url)
+        elif extension in {".xlsx", ".xls"}:
+            result = _load_excel(raw, url)
+        elif extension == ".json":
+            result = _load_json(raw, url)
+        else:
+            return ScoutResult(is_dataset=False, source=url, source_type="url",
+                               rejection_reason=f"Unsupported extension: {extension}")
+
+        if not trusted:
+            result.confidence_score = round(result.confidence_score * 0.85, 2)
+        return result
+
+    # ---- HTML scraping ----
+    try:
+        raw, content_type = _fetch_url(url)
+    except Exception as e:
+        return ScoutResult(is_dataset=False, source=url, source_type="url",
+                           rejection_reason=f"Fetch failed: {e}")
+
+    if "text/html" not in content_type and "application/xhtml" not in content_type:
+        return ScoutResult(is_dataset=False, source=url, source_type="url",
+                           rejection_reason=(
+                               f"Non-HTML content type '{content_type}' "
+                               "with no recognised dataset extension."
+                           ))
+
+    html = raw.decode(errors="replace")
+    best_df, tables_found = _html_to_best_df(html)
+
+    if best_df is None:
+        # Optional LLM fallback
+        if use_llm:
+            ok, conf, reason = _llm_confirm_dataset(html[:3000], ollama_host, ollama_model)
+            if not ok:
+                return ScoutResult(is_dataset=False, source=url, source_type="url",
+                                   rejection_reason=f"LLM rejected: {reason}",
+                                   tables_found=tables_found)
+        return ScoutResult(is_dataset=False, source=url, source_type="url",
+                           rejection_reason="No usable HTML tables found.",
+                           tables_found=tables_found)
+
+    confidence = _score_html_table(best_df)
+    if not trusted:
+        confidence = round(confidence * 0.85, 2)
+
+    # Optional LLM confirmation for borderline cases
+    if use_llm and confidence < 0.70:
+        snippet = best_df.head(10).to_csv(index=False)
+        ok, llm_conf, reason = _llm_confirm_dataset(snippet, ollama_host, ollama_model)
+        if not ok:
+            return ScoutResult(is_dataset=False, source=url, source_type="url",
+                               rejection_reason=f"LLM rejected: {reason}",
+                               tables_found=tables_found)
+        confidence = (confidence + llm_conf) / 2
+
+    return _summarise_df(best_df, url, "url", confidence, tables_found)
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def scout(
+    source: "str | Path | bytes",
+    *,
+    source_type: str = "auto",          # "auto" | "url" | "csv" | "xlsx" | "json" | "text"
+    filename: str = "",                  # hint for bytes input
+    use_llm: bool = False,
+    ollama_host: str = "http://127.0.0.1:11434",
+    ollama_model: str = "llama3.2:3b",
+) -> dict[str, Any]:
+    """
+    Main entry-point for the Scout Agent.
+
+    Parameters
+    ----------
+    source      : URL string, local file path, or raw bytes (for uploads).
+    source_type : Explicit type override; defaults to auto-detect.
+    filename    : Original filename — used to detect type when source is bytes.
+    use_llm     : Enable optional Ollama confirmation for edge cases.
+    ollama_host : Ollama server base URL.
+    ollama_model: Ollama model name.
+
+    Returns
+    -------
+    dict matching the ScoutResult schema.
+    """
+
+    # ---- Bytes (Streamlit UploadedFile / raw upload) ----
+    if isinstance(source, (bytes, bytearray)):
+        ext = Path(filename).suffix.lower() if filename else ""
+        src_label = filename or "uploaded_file"
+
+        if ext == ".csv" or source_type == "csv":
+            result = _load_csv(bytes(source), src_label)
+        elif ext in {".xlsx", ".xls"} or source_type == "xlsx":
+            result = _load_excel(bytes(source), src_label)
+        elif ext == ".json" or source_type == "json":
+            result = _load_json(bytes(source), src_label)
+        else:
+            # Try CSV → Excel → JSON in sequence
+            for loader in (_load_csv, _load_excel, _load_json):
+                result = loader(bytes(source), src_label)
+                if result.is_dataset:
+                    break
+            else:
+                result = ScoutResult(
+                    is_dataset=False, source=src_label, source_type="unknown",
+                    rejection_reason="Could not parse uploaded bytes as CSV, Excel, or JSON."
+                )
+        return result.model_dump()
+
+    # ---- Streamlit UploadedFile duck-type ----
+    if hasattr(source, "read") and hasattr(source, "name"):
+        raw = source.read()
+        return scout(raw, source_type=source_type, filename=source.name,
+                     use_llm=use_llm, ollama_host=ollama_host, ollama_model=ollama_model)
+
+    source = str(source).strip()
+
+    # ---- Auto-detect type ----
+    if source_type == "auto":
+        if source.startswith("http://") or source.startswith("https://"):
+            source_type = "url"
+        elif source.lower().endswith(".csv"):
+            source_type = "csv"
+        elif source.lower().endswith((".xlsx", ".xls")):
+            source_type = "xlsx"
+        elif source.lower().endswith(".json"):
+            source_type = "json"
+        else:
+            source_type = "text"
+
+    # ---- Dispatch ----
+    if source_type == "url":
+        result = _scout_url(source, use_llm=use_llm,
+                            ollama_host=ollama_host, ollama_model=ollama_model)
+
+    elif source_type == "csv":
+        result = _load_csv(source, source)
+
+    elif source_type == "xlsx":
+        result = _load_excel(source, source)
+
+    elif source_type == "json":
+        result = _load_json(source, source)
+
+    else:  # raw text — attempt CSV parse
+        try:
+            df = pd.read_csv(io.StringIO(source))
+            result = _summarise_df(df, "raw_text_input", "text", confidence=0.60)
+        except Exception:
+            result = ScoutResult(
+                is_dataset=False, source="raw_text_input", source_type="text",
+                rejection_reason="Raw text could not be parsed as tabular data."
+            )
+
+    return result.model_dump()
+
+
+def run_scout(
+    source: "str | Path | bytes",
+    *,
+    source_type: str = "auto",
+    filename: str = "",
+    use_llm: bool = False,
+    ollama_host: str = "http://127.0.0.1:11434",
+    ollama_model: str = "llama3.2:3b",
+) -> dict[str, Any]:
+    """Canonical Scout runner used by orchestration."""
+    return scout(
+        source,
+        source_type=source_type,
+        filename=filename,
+        use_llm=use_llm,
+        ollama_host=ollama_host,
+        ollama_model=ollama_model,
+    )
+
+# ---------------------------------------------------------------------------
+# Streamlit integration helper
+# ---------------------------------------------------------------------------
+
+def streamlit_scout_widget() -> None:
+    """
+    Drop-in Streamlit UI component for the Scout Agent.
+    Call this inside a Streamlit app to get a complete upload / URL widget.
+    """
+    try:
+        import streamlit as st
+    except ImportError:
+        raise ImportError("streamlit is required for streamlit_scout_widget().")
+
+    st.subheader("🔍 Scout Agent — Dataset Acquisition")
+
+    tab_url, tab_file = st.tabs(["🌐 URL", "📁 Upload File"])
+
+    result: dict[str, Any] | None = None
+
+    with tab_url:
+        url_input = st.text_input("Dataset URL", placeholder="https://data.gov/dataset.csv")
+        use_llm = st.checkbox("Use LLM confirmation (requires local Ollama)", value=False)
+        if st.button("Scout URL", key="scout_url_btn"):
+            if url_input.strip():
+                with st.spinner("Scouting…"):
+                    result = scout(url_input.strip(), use_llm=use_llm)
+            else:
+                st.warning("Please enter a URL.")
+
+    with tab_file:
+        uploaded = st.file_uploader(
+            "Upload CSV, Excel, or JSON",
+            type=["csv", "xlsx", "xls", "json"],
+        )
+        if uploaded is not None:
+            with st.spinner("Loading file…"):
+                result = scout(uploaded)
+
+    if result:
+        _render_result(result)
+
+
+def _render_result(result: dict[str, Any]) -> None:
+    try:
+        import streamlit as st
+    except ImportError:
+        print(json.dumps(result, indent=2))
+        return
+
+    if result["is_dataset"]:
+        st.success(
+            f"✅ Valid dataset — {result['num_rows']:,} rows × "
+            f"{result['num_columns']} columns "
+            f"(confidence: {result['confidence_score']:.0%})"
+        )
+        st.json({
+            "source": result["source"],
+            "source_type": result["source_type"],
+            "columns": result["columns"],
+            "dtypes": result["dtypes"],
+            "num_rows": result["num_rows"],
+            "num_columns": result["num_columns"],
+            "tables_found": result["tables_found"],
+        })
+        if result["sample_data"]:
+            st.subheader("Sample Data (first 5 rows)")
+            import pandas as pd
+            st.dataframe(pd.DataFrame(result["sample_data"]))
+    else:
+        st.error(f"❌ Not a valid dataset — {result.get('rejection_reason', 'Unknown reason')}")
+        st.json(result)
+
+# ---------------------------------------------------------------------------
+# CLI entry-point
+# ---------------------------------------------------------------------------
 
 def main() -> int:
-    load_dotenv()
+    import argparse
+    from dotenv import load_dotenv
 
-    parser = argparse.ArgumentParser(description="Phase 1 Scout: crawl URL + extract metadata via local Ollama.")
-    parser.add_argument("url", help="URL to crawl")
-    parser.add_argument("--limit", type=int, default=5, help="Spider crawl limit (default: 5)")
-    parser.add_argument("--return-format", default="markdown", help="Spider return_format (default: markdown)")
-    parser.add_argument("--out-dir", default="runs", help="Output directory (default: runs)")
+    env_file = Path(__file__).parent.parent / ".env"
+    load_dotenv(dotenv_path=env_file)
+
+    parser = argparse.ArgumentParser(
+        description="Scout Agent: identify and acquire usable datasets."
+    )
+    parser.add_argument("source", help="URL, file path (.csv/.xlsx/.json), or raw text")
+    parser.add_argument("--type", dest="source_type", default="auto",
+                        choices=["auto", "url", "csv", "xlsx", "json", "text"])
+    parser.add_argument("--use-llm", action="store_true",
+                        help="Enable optional Ollama LLM confirmation")
+    parser.add_argument("--ollama-host", default=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"))
+    parser.add_argument("--ollama-model", default=os.getenv("OLLAMA_MODEL", "llama3.2:3b"))
+    parser.add_argument("--out-dir", default=None,
+                        help="If set, save result JSON to this directory")
     args = parser.parse_args()
 
-    source_url = args.url.strip()
-    if not source_url:
-        raise RuntimeError("URL must be non-empty.")
+    result = scout(
+        args.source,
+        source_type=args.source_type,
+        use_llm=args.use_llm,
+        ollama_host=args.ollama_host,
+        ollama_model=args.ollama_model,
+    )
 
-    run_ts = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    run_dir = Path("backend") / args.out_dir / f"{run_ts}_{_safe_slug(source_url)}"
-    _ensure_dir(run_dir)
+    output = json.dumps(result, ensure_ascii=False, indent=2)
+    print(output)
 
-    crawled = crawl_with_spider(source_url, limit=args.limit, return_format=args.return_format)
-    _write_json(run_dir / "crawl_raw.json", crawled)
+    if args.out_dir:
+        out_path = Path(args.out_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        (out_path / f"scout_{ts}.json").write_text(output, encoding="utf-8")
 
-    extracted = extract_entities_with_ollama(source_url, crawled)
-    _write_json(run_dir / "extracted_metadata.json", extracted.model_dump())
-
-    print(json.dumps(extracted.model_dump(), ensure_ascii=False, indent=2))
-    return 0
+    return 0 if result["is_dataset"] else 1
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except KeyboardInterrupt:
-        raise SystemExit(130)
+    raise SystemExit(main())

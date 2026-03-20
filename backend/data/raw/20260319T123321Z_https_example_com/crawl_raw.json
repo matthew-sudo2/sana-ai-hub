@@ -1,0 +1,25 @@
+{
+  "pages": [
+    {
+      "content": "Example Domain\n# Example Domain\nThis domain is for use in documentation examples without needing permission. Avoid use in operations.\n[Learn more](https://iana.org/domains/example)",
+      "costs": {
+        "ai_cost": 0.0,
+        "ai_cost_formatted": "0",
+        "bytes_transferred_cost": 4.3665e-07,
+        "bytes_transferred_cost_formatted": "0.0000004366499999999999739583",
+        "compute_cost": 5.166666666666667e-08,
+        "compute_cost_formatted": "0.0000000516666666666666684650",
+        "file_cost": 7.92e-07,
+        "file_cost_formatted": "0.0000007919999999999999956701",
+        "total_cost": 1.1280316666666668e-05,
+        "total_cost_formatted": "0.0000112803166666666671932050",
+        "transform_cost": 1e-05,
+        "transform_cost_formatted": "0.0000100000000000000005551115"
+      },
+      "duration_elasped_ms": 32,
+      "error": null,
+      "status": 200,
+      "url": "https://example.com/"
+    }
+  ]
+}

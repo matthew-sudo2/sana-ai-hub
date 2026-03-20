@@ -15,6 +15,7 @@ dist-ssr
 # Backend runtime artifacts
 backend/runs
 backend/.env
+backend/.scout_last_run
 backend/__pycache__/
 .sana/
 
