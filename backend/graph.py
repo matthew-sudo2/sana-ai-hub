@@ -12,10 +12,9 @@ import os
 import subprocess
 import sys
 import uuid
-from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -24,20 +23,20 @@ import seaborn as sns
 from langgraph.graph import END, START, StateGraph
 
 
-@dataclass
-class PipelineState:
+class PipelineState(TypedDict, total=False):
+    """Pipeline state for LangGraph - compatible TypedDict."""
     run_id: str
     source: str
     phase: str
     status: str
-    error: str | None = None
-    source_type: str = "auto"  # "auto" | "url" | "csv" | "xlsx" | "json" | "uploaded_file"
-    run_dir: str | None = None
-    scout_output_dir: str | None = None
-    labeler_output_dir: str | None = None
-    analyst_output_dir: str | None = None
-    artist_output_dir: str | None = None
-    validator_output_dir: str | None = None
+    error: str | None
+    source_type: str
+    run_dir: str | None
+    scout_output_dir: str | None
+    labeler_output_dir: str | None
+    analyst_output_dir: str | None
+    artist_output_dir: str | None
+    validator_output_dir: str | None
 
 
 def _slug(text: str, max_len: int = 80) -> str:
@@ -49,9 +48,9 @@ def _slug(text: str, max_len: int = 80) -> str:
 
 
 def _state_error(state: PipelineState, phase: str, message: str) -> PipelineState:
-    state.phase = phase
-    state.status = "error"
-    state.error = message
+    state["phase"] = phase
+    state["status"] = "error"
+    state["error"] = message
     return state
 
 
@@ -87,17 +86,17 @@ def _read_json(path: Path) -> Any:
 
 
 def _resolve_run_dir(state: PipelineState) -> Path:
-    if state.run_dir:
-        run_dir = Path(state.run_dir)
+    if state["run_dir"]:
+        run_dir = Path(state["run_dir"])
     else:
         ts = dt.datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        run_dir = Path(__file__).parent / "runs" / f"{ts}_{_slug(state.source)}"
+        run_dir = Path(__file__).parent / "runs" / f"{ts}_{_slug(state['source'])}"
     run_dir.mkdir(parents=True, exist_ok=True)
-    state.run_dir = str(run_dir)
+    state["run_dir"] = str(run_dir)
     return run_dir
 
 
-def _compat_scout(source: str) -> dict[str, Any]:
+def _compat_scout(source: str, run_dir: Path | None = None) -> dict[str, Any]:
     """Fallback scout for local files and text when agent unavailable."""
     path = Path(source)
     source_type = "text"
@@ -113,6 +112,7 @@ def _compat_scout(source: str) -> dict[str, Any]:
             "num_rows": 0,
             "num_columns": 0,
             "sample_data": [],
+            "raw_data_path": None,
             "confidence_score": 0.0,
             "rejection_reason": "URL scout fallback unavailable without agent support",
             "tables_found": 0,
@@ -143,6 +143,7 @@ def _compat_scout(source: str) -> dict[str, Any]:
                 "num_rows": 0,
                 "num_columns": 0,
                 "sample_data": [],
+                "raw_data_path": None,
                 "confidence_score": 0.0,
                 "rejection_reason": "Source could not be parsed as tabular data",
                 "tables_found": 0,
@@ -159,11 +160,21 @@ def _compat_scout(source: str) -> dict[str, Any]:
             "num_rows": 0,
             "num_columns": 0,
             "sample_data": [],
+            "raw_data_path": None,
             "confidence_score": 0.0,
             "rejection_reason": "Parsed dataset is empty",
             "tables_found": 1,
             "timestamp": dt.datetime.now(timezone.utc).isoformat(),
         }
+
+    # Save full DataFrame to raw_data.csv if run_dir provided
+    raw_data_path: str | None = None
+    if run_dir:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        raw_csv = run_dir / "raw_data.csv"
+        df.to_csv(raw_csv, index=False)
+        raw_data_path = str(raw_csv)
+        print(f"[scout] Saved full dataset ({len(df)} rows) to {raw_csv}")
 
     dtypes = {}
     for col in df.columns:
@@ -187,7 +198,8 @@ def _compat_scout(source: str) -> dict[str, Any]:
         "dtypes": dtypes,
         "num_rows": int(len(df)),
         "num_columns": int(len(df.columns)),
-        "sample_data": df.head(5).to_dict(orient="records"),
+        "sample_data": df.head(5).astype(str).to_dict(orient="records"),
+        "raw_data_path": raw_data_path,
         "confidence_score": 0.85,
         "rejection_reason": None,
         "tables_found": 1,
@@ -200,12 +212,35 @@ def _compat_labeler(run_dir: Path, scout_result: dict[str, Any]) -> None:
     if not scout_result.get("is_dataset"):
         raise RuntimeError(scout_result.get("rejection_reason") or "Scout rejected input")
 
-    sample_data = scout_result.get("sample_data") or []
-    if sample_data:
-        df = pd.DataFrame(sample_data)
+    # Priority 1: raw_data.csv in run_dir (full dataset written by scout)
+    raw_csv = run_dir / "raw_data.csv"
+    if raw_csv.exists():
+        df = pd.read_csv(raw_csv)
+        print(f"[labeler] Loaded {len(df):,} rows from {raw_csv}")
+    # Priority 2: raw_data_path from scout JSON
+    elif scout_result.get("raw_data_path"):
+        src_path = Path(scout_result["raw_data_path"])
+        if src_path.exists():
+            df = pd.read_csv(src_path)
+            df.to_csv(raw_csv, index=False)
+            print(f"[labeler] Loaded {len(df):,} rows from scout raw_data_path and copied to {raw_csv}")
+        else:
+            print(f"[labeler] Warning: raw_data_path {src_path} not found, falling back to sample_data")
+            sample_data = scout_result.get("sample_data") or []
+            if sample_data:
+                df = pd.DataFrame(sample_data)
+            else:
+                cols = [str(c) for c in scout_result.get("columns", [])]
+                df = pd.DataFrame(columns=cols)
+    # Priority 3: sample_data fallback with warning
     else:
-        cols = [str(c) for c in scout_result.get("columns", [])]
-        df = pd.DataFrame(columns=cols)
+        print("[labeler] Warning: No raw_data.csv or raw_data_path found; using sample_data (only 5 rows)")
+        sample_data = scout_result.get("sample_data") or []
+        if sample_data:
+            df = pd.DataFrame(sample_data)
+        else:
+            cols = [str(c) for c in scout_result.get("columns", [])]
+            df = pd.DataFrame(columns=cols)
 
     if df.empty:
         raise RuntimeError("No rows available for cleaning")
@@ -473,20 +508,20 @@ def _compat_visualization(run_dir: Path) -> None:
 
 
 def scout_node(state: PipelineState) -> PipelineState:
-    state.phase = "scout"
-    state.status = "running"
+    state["phase"] = "scout"
+    state["status"] = "running"
 
-    if not state.source or not state.source.strip():
+    if not state["source"] or not state["source"].strip():
         return _state_error(state, "scout", "SCOUT_ERROR: source is empty")
 
     try:
         run_dir = _resolve_run_dir(state)
 
         # For uploaded files, skip actual scouting and create a synthetic scout result
-        if state.source_type == "uploaded_file":
-            path = Path(state.source)
+        if state["source_type"] == "uploaded_file":
+            path = Path(state["source"])
             if not path.exists():
-                return _state_error(state, "scout", f"SCOUT_ERROR: Uploaded file not found: {state.source}")
+                return _state_error(state, "scout", f"SCOUT_ERROR: Uploaded file not found: {state['source']}")
             
             # Read the file to determine basic info
             file_ext = path.suffix.lower()
@@ -497,81 +532,90 @@ def scout_node(state: PipelineState) -> PipelineState:
                     df = pd.read_csv(path)
                     result = {
                         "is_dataset": True,
-                        "source": state.source,
+                        "source": state["source"],
                         "source_type": "csv",
                         "columns": list(df.columns.astype(str)),
                         "dtypes": {col: ("categorical" if df[col].dtype == "object" else "numeric") for col in df.columns},
                         "num_rows": len(df),
                         "num_columns": len(df.columns),
                         "sample_data": df.head(5).astype(str).to_dict(orient="records"),
+                        "raw_data_path": None,
                         "confidence_score": 1.0,
                         "rejection_reason": None,
                         "tables_found": 1,
                         "timestamp": dt.datetime.now(timezone.utc).isoformat(),
                     }
+                    df.to_csv(run_dir / "raw_data.csv", index=False)
+                    print(f"[scout] Saved uploaded CSV ({len(df)} rows) to raw_data.csv")
                 elif file_ext in {".xlsx", ".xls"}:
                     df = pd.read_excel(path)
                     result = {
                         "is_dataset": True,
-                        "source": state.source,
+                        "source": state["source"],
                         "source_type": "xlsx",
                         "columns": list(df.columns.astype(str)),
                         "dtypes": {col: ("categorical" if df[col].dtype == "object" else "numeric") for col in df.columns},
                         "num_rows": len(df),
                         "num_columns": len(df.columns),
                         "sample_data": df.head(5).astype(str).to_dict(orient="records"),
+                        "raw_data_path": None,
                         "confidence_score": 1.0,
                         "rejection_reason": None,
                         "tables_found": 1,
                         "timestamp": dt.datetime.now(timezone.utc).isoformat(),
                     }
+                    df.to_csv(run_dir / "raw_data.csv", index=False)
+                    print(f"[scout] Saved uploaded Excel ({len(df)} rows) to raw_data.csv")
                 elif file_ext == ".json":
                     payload = _read_json(path)
                     df = pd.json_normalize(payload) if isinstance(payload, dict) else pd.DataFrame(payload)
                     result = {
                         "is_dataset": True,
-                        "source": state.source,
+                        "source": state["source"],
                         "source_type": "json",
                         "columns": list(df.columns.astype(str)),
                         "dtypes": {col: ("categorical" if df[col].dtype == "object" else "numeric") for col in df.columns},
                         "num_rows": len(df),
                         "num_columns": len(df.columns),
                         "sample_data": df.head(5).astype(str).to_dict(orient="records"),
+                        "raw_data_path": None,
                         "confidence_score": 1.0,
                         "rejection_reason": None,
                         "tables_found": 1,
                         "timestamp": dt.datetime.now(timezone.utc).isoformat(),
                     }
+                    df.to_csv(run_dir / "raw_data.csv", index=False)
+                    print(f"[scout] Saved uploaded JSON ({len(df)} rows) to raw_data.csv")
                 else:
                     return _state_error(state, "scout", f"SCOUT_ERROR: Unsupported file format: {file_ext}")
             except Exception as e:
                 return _state_error(state, "scout", f"SCOUT_ERROR: Failed to read uploaded file: {e}")
             
             _write_json(run_dir / "scout_result.json", result)
-            state.scout_output_dir = str(run_dir)
-            state.status = "success"
+            state["scout_output_dir"] = str(run_dir)
+            state["status"] = "success"
             return state
 
         # For non-uploaded files, proceed with normal scouting logic
         result: dict[str, Any]
         try:
-            from .agents.scout import run_scout
+            from .agents.scout import scout
 
-            result = run_scout(state.source.strip())
+            result = scout(state["source"].strip())
         except Exception:
-            cmd = [sys.executable, str(Path(__file__).parent / "agents" / "scout.py"), state.source.strip()]
+            cmd = [sys.executable, str(Path(__file__).parent / "agents" / "scout.py"), state["source"].strip()]
             code, stdout, stderr = _run_cmd(cmd)
             if code == 0:
                 result = _json_from_output(stdout)
             else:
-                result = _compat_scout(state.source.strip())
+                result = _compat_scout(state["source"].strip(), run_dir)
                 if not result.get("is_dataset"):
                     return _state_error(state, "scout", f"SCOUT_ERROR: {stderr or stdout or result.get('rejection_reason')}" )
 
         _write_json(run_dir / "scout_result.json", result)
 
         if not bool(result.get("is_dataset", False)):
-            compat = _compat_scout(state.source.strip())
+            compat = _compat_scout(state["source"].strip(), run_dir)
             if bool(compat.get("is_dataset", False)):
                 result = compat
                 _write_json(run_dir / "scout_result.json", result)
@@ -579,25 +623,25 @@ def scout_node(state: PipelineState) -> PipelineState:
                 reason = result.get("rejection_reason") or compat.get("rejection_reason") or "Source was not accepted as dataset"
                 return _state_error(state, "scout", f"SCOUT_ERROR: {reason}")
 
-        state.scout_output_dir = str(run_dir)
-        state.status = "success"
+        state["scout_output_dir"] = str(run_dir)
+        state["status"] = "success"
         return state
     except Exception as e:
         return _state_error(state, "scout", f"SCOUT_ERROR: {e}")
 
 
 def labeler_node(state: PipelineState) -> PipelineState:
-    if state.status == "error":
+    if state["status"] == "error":
         return state
 
-    state.phase = "labeler"
-    state.status = "running"
+    state["phase"] = "labeler"
+    state["status"] = "running"
 
-    if not state.scout_output_dir:
+    if not state["scout_output_dir"]:
         return _state_error(state, "labeler", "LABELER_ERROR: Missing scout output directory")
 
     try:
-        run_dir = Path(state.scout_output_dir)
+        run_dir = Path(state["scout_output_dir"])
         scout_json_path = run_dir / "scout_result.json"
         if not scout_json_path.exists():
             return _state_error(state, "labeler", f"LABELER_ERROR: Missing file {scout_json_path}")
@@ -610,7 +654,6 @@ def labeler_node(state: PipelineState) -> PipelineState:
                 scout_json_path=scout_json_path,
                 model=os.getenv("OLLAMA_PHASE2_MODEL", "qwen2.5-coder:3b"),
                 ollama_host=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
-                out_dir="runs",
             )
             completed = True
         except Exception:
@@ -639,25 +682,25 @@ def labeler_node(state: PipelineState) -> PipelineState:
         if not cleaned_csv.exists() or cleaned_csv.stat().st_size == 0:
             return _state_error(state, "labeler", f"LABELER_ERROR: Missing cleaned output {cleaned_csv}")
 
-        state.labeler_output_dir = str(run_dir)
-        state.status = "success"
+        state["labeler_output_dir"] = str(run_dir)
+        state["status"] = "success"
         return state
     except Exception as e:
         return _state_error(state, "labeler", f"LABELER_ERROR: {e}")
 
 
 def analyst_node(state: PipelineState) -> PipelineState:
-    if state.status == "error":
+    if state["status"] == "error":
         return state
 
-    state.phase = "analyst"
-    state.status = "running"
+    state["phase"] = "analyst"
+    state["status"] = "running"
 
-    if not state.labeler_output_dir:
+    if not state["labeler_output_dir"]:
         return _state_error(state, "analyst", "ANALYST_ERROR: Missing labeler output directory")
 
     try:
-        run_dir = Path(state.labeler_output_dir)
+        run_dir = Path(state["labeler_output_dir"])
         cleaned_csv = run_dir / "cleaned_data.csv"
         if not cleaned_csv.exists():
             return _state_error(state, "analyst", f"ANALYST_ERROR: Missing file {cleaned_csv}")
@@ -684,25 +727,25 @@ def analyst_node(state: PipelineState) -> PipelineState:
         if not (run_dir / "analysis_result.json").exists() or not (run_dir / "enriched_data.csv").exists():
             return _state_error(state, "analyst", "ANALYST_ERROR: Missing analysis_result.json or enriched_data.csv")
 
-        state.analyst_output_dir = str(run_dir)
-        state.status = "success"
+        state["analyst_output_dir"] = str(run_dir)
+        state["status"] = "success"
         return state
     except Exception as e:
         return _state_error(state, "analyst", f"ANALYST_ERROR: {e}")
 
 
 def artist_node(state: PipelineState) -> PipelineState:
-    if state.status == "error":
+    if state["status"] == "error":
         return state
 
-    state.phase = "artist"
-    state.status = "running"
+    state["phase"] = "artist"
+    state["status"] = "running"
 
-    if not state.analyst_output_dir:
+    if not state["analyst_output_dir"]:
         return _state_error(state, "artist", "ARTIST_ERROR: Missing analyst output directory")
 
     try:
-        run_dir = Path(state.analyst_output_dir)
+        run_dir = Path(state["analyst_output_dir"])
         enriched_csv = run_dir / "enriched_data.csv"
         analysis_json = run_dir / "analysis_result.json"
 
@@ -729,25 +772,25 @@ def artist_node(state: PipelineState) -> PipelineState:
         if not completed or not (run_dir / "viz_summary.json").exists():
             return _state_error(state, "artist", "ARTIST_ERROR: Missing viz_summary.json")
 
-        state.artist_output_dir = str(run_dir)
-        state.status = "success"
+        state["artist_output_dir"] = str(run_dir)
+        state["status"] = "success"
         return state
     except Exception as e:
         return _state_error(state, "artist", f"ARTIST_ERROR: {e}")
 
 
 def validator_node(state: PipelineState) -> PipelineState:
-    if state.status == "error":
+    if state["status"] == "error":
         return state
 
-    state.phase = "validator"
-    state.status = "running"
+    state["phase"] = "validator"
+    state["status"] = "running"
 
-    if not state.artist_output_dir:
+    if not state["artist_output_dir"]:
         return _state_error(state, "validator", "VALIDATOR_ERROR: Missing artist output directory")
 
     try:
-        run_dir = Path(state.artist_output_dir)
+        run_dir = Path(state["artist_output_dir"])
 
         try:
             from .agents.validator import run_validation
@@ -761,14 +804,20 @@ def validator_node(state: PipelineState) -> PipelineState:
             result = _json_from_output(stdout)
 
         if result.get("status") == "REJECTED":
-            return _state_error(state, "validator", "VALIDATOR_ERROR: Validation rejected the run")
+            report_path = run_dir / "validation_report.md"
+            report_content = report_path.read_text() if report_path.exists() else "Validation report not available"
+            print(f"[validator] Validation REJECTED with report:\n{report_content}")
+            state["validator_output_dir"] = str(run_dir)
+            state["phase"] = "complete"
+            state["status"] = "rejected"
+            return state
 
         if not (run_dir / "validation_result.json").exists() or not (run_dir / "validation_report.md").exists():
             return _state_error(state, "validator", "VALIDATOR_ERROR: Missing validation outputs")
 
-        state.validator_output_dir = str(run_dir)
-        state.phase = "complete"
-        state.status = "success"
+        state["validator_output_dir"] = str(run_dir)
+        state["phase"] = "complete"
+        state["status"] = "success"
         return state
     except Exception as e:
         return _state_error(state, "validator", f"VALIDATOR_ERROR: {e}")
@@ -813,13 +862,20 @@ def create_run(source: str, source_type: str = "auto") -> str:
         else:
             source_type = "url"  # Default to treating unknown as URL
     
-    _RUNS[run_id] = PipelineState(
-        run_id=run_id,
-        source=source,
-        phase="pending",
-        status="pending",
-        source_type=source_type,
-    )
+    _RUNS[run_id] = {
+        "run_id": run_id,
+        "source": source,
+        "phase": "pending",
+        "status": "pending",
+        "source_type": source_type,
+        "error": None,
+        "run_dir": None,
+        "scout_output_dir": None,
+        "labeler_output_dir": None,
+        "analyst_output_dir": None,
+        "artist_output_dir": None,
+        "validator_output_dir": None,
+    }
     return run_id
 
 
@@ -834,28 +890,28 @@ def execute_run(run_id: str) -> None:
 
     try:
         graph = build_graph()
-        state_dict: dict[str, Any] = {
-            "run_id": state.run_id,
-            "source": state.source,
-            "phase": state.phase,
-            "status": state.status,
-            "error": state.error,
-            "source_type": state.source_type,
-            "run_dir": state.run_dir,
-            "scout_output_dir": state.scout_output_dir,
-            "labeler_output_dir": state.labeler_output_dir,
-            "analyst_output_dir": state.analyst_output_dir,
-            "artist_output_dir": state.artist_output_dir,
-            "validator_output_dir": state.validator_output_dir,
-        }
+        state_dict: PipelineState = dict(state)  # TypedDict to dict
 
         for output in graph.stream(state_dict):
             for _, node_state in output.items():
-                _RUNS[run_id] = PipelineState(**node_state) if isinstance(node_state, dict) else node_state
+                if isinstance(node_state, dict):
+                    _RUNS[run_id] = dict(node_state)  # Update stored state after each node
+                else:
+                    _RUNS[run_id] = node_state
     except Exception as e:
-        state.status = "error"
-        state.error = f"EXECUTION_ERROR: {e}"
-        _RUNS[run_id] = state
+        # Persist the error state even on exception
+        current_state = _RUNS.get(run_id, {})
+        if isinstance(current_state, dict):
+            current_state["status"] = "error"
+            current_state["error"] = f"EXECUTION_ERROR: {e}"
+            _RUNS[run_id] = current_state
+        else:
+            current_state["status"] = "error"
+            current_state["error"] = f"EXECUTION_ERROR: {e}"
+            _RUNS[run_id] = current_state
+        print(f"[execute_run] Exception during graph execution: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 __all__ = ["PipelineState", "create_run", "get_run", "execute_run", "build_graph"]

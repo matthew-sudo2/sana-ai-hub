@@ -1,3 +1,23 @@
+"""
+Data Analysis Agent — Phase 3
+Receives cleaned_data.csv (from Labeler/Cleaning Agent) and produces
+analytical results, metrics, and an enriched summary for the Visualization Agent.
+
+Responsibilities:
+  1. Basic statistics  — mean, median, std, quartiles per numeric column
+  2. Pattern / trend   — monotonicity, rolling-mean slope, value-frequency ranks
+  3. Correlation       — Pearson matrix + ranked pairs
+  4. Anomaly detection — IQR-based outlier flagging per numeric column
+  5. Categorical insight — top-N value counts per categorical column
+  6. Output            — analysis_result.json  (machine-readable, feeds Viz Agent)
+                         analysis_report.md    (human-readable summary)
+                         enriched_data.csv     (original rows + outlier flag column)
+
+Fixes applied vs previous version:
+  - _is_outlier column filtered out before analysis (prevents bleed-in on re-runs)
+  - _iqr_outliers guards against all-NaN columns (was crashing on empty series)
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -7,7 +27,6 @@ import json
 import os
 import re
 import subprocess
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -16,38 +35,74 @@ from pydantic import BaseModel, Field, ValidationError
 
 import numpy as np
 import pandas as pd
-from PIL import Image
 
 
-class UnsafeModelOutputError(RuntimeError):
-    pass
-
+# ---------------------------------------------------------------------------
+# Output schemas  (consumed by Visualization Agent downstream)
+# ---------------------------------------------------------------------------
 
 CorrelationStrength = Literal["weak", "moderate", "strong"]
 CorrelationDirection = Literal["positive", "negative"]
 
 
-class CorrelationClaim(BaseModel):
-    type: Literal["correlation"] = "correlation"
-    col_a: str = Field(min_length=1)
-    col_b: str = Field(min_length=1)
-    direction: CorrelationDirection
+class ColumnStats(BaseModel):
+    column: str
+    dtype: str
+    mean: float | None = None
+    median: float | None = None
+    std: float | None = None
+    min: float | None = None
+    max: float | None = None
+    q1: float | None = None
+    q3: float | None = None
+    missing_count: int = 0
+    missing_pct: float = 0.0
+    outlier_count: int = 0          # IQR-based
+    trend: str | None = None        # "increasing" | "decreasing" | "flat" | None
+
+
+class CorrelationPair(BaseModel):
+    col_a: str
+    col_b: str
+    pearson_r: float
     strength: CorrelationStrength
+    direction: CorrelationDirection
 
 
-class Phase4ModelOutput(BaseModel):
-    analysis_markdown: str = Field(min_length=1)
-    claims: list[CorrelationClaim] = Field(default_factory=list)
+class CategoricalInsight(BaseModel):
+    column: str
+    unique_count: int
+    top_values: list[dict[str, Any]]   # [{"value": x, "count": n, "pct": p}, …]
 
 
-@dataclass(frozen=True)
-class ImageMetadata:
-    path: str
-    width_px: int
-    height_px: int
-    dpi_x: float | None
-    dpi_y: float | None
+class Anomaly(BaseModel):
+    column: str
+    row_indices: list[int]
+    lower_fence: float
+    upper_fence: float
+    outlier_count: int
 
+
+class AnalysisResult(BaseModel):
+    source: str
+    source_type: str
+    num_rows: int
+    num_columns: int
+    numeric_columns: list[str]
+    categorical_columns: list[str]
+    column_stats: list[ColumnStats]
+    correlations: list[CorrelationPair]
+    categorical_insights: list[CategoricalInsight]
+    anomalies: list[Anomaly]
+    key_insights: list[str]         # bullet-ready plain-English findings
+    timestamp: str = Field(
+        default_factory=lambda: dt.datetime.now(timezone.utc).isoformat()
+    )
+
+
+# ---------------------------------------------------------------------------
+# Filesystem helpers
+# ---------------------------------------------------------------------------
 
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
@@ -70,107 +125,79 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _ollama_generate(model: str, prompt: str, host: str) -> str:
-    """Generate analysis report via Ollama, with fallback when unavailable."""
-    options = {
-        "temperature": 0.1,
-        "top_p": 0.9,
-        "num_ctx": 8192,
-    }
+# ---------------------------------------------------------------------------
+# Internal columns that must never be analysed
+# ---------------------------------------------------------------------------
 
+_INTERNAL_COLS = {"_is_outlier"}
+
+
+def _drop_internal_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove pipeline-internal columns before analysis to prevent bleed-in."""
+    to_drop = [c for c in df.columns if c in _INTERNAL_COLS]
+    if to_drop:
+        print(f"[analyst] Dropping internal columns before analysis: {to_drop}", flush=True)
+        df = df.drop(columns=to_drop)
+    return df
+
+
+def _sanitize_for_markdown(value: str) -> str:
+    """Escape special markdown characters for safe table rendering."""
+    if value is None:
+        return ""
+    value = str(value)
+    # Escape pipe characters for markdown tables
+    value = value.replace("|", "•")
+    # Escape leading characters that might cause markdown confusion
+    if value.startswith(("#", "-", "*", ">")):
+        value = " " + value
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Ollama helper (optional LLM insight enrichment)
+# ---------------------------------------------------------------------------
+
+def _ollama_alive(host: str) -> bool:
+    try:
+        import requests
+        return requests.get(f"{host}/api/tags", timeout=2).status_code == 200
+    except Exception:
+        return False
+
+
+def _ollama_generate(model: str, prompt: str, host: str) -> str:
+    if not _ollama_alive(host):
+        return ""
     try:
         import ollama  # type: ignore
-        import requests
-        
-        # Check if Ollama is alive first
-        try:
-            requests.get(f"{host}/api/tags", timeout=2)
-        except Exception:
-            return _generate_fallback_report()
-
         client = ollama.Client(host=host)
         resp = client.generate(
-            model=model,
-            prompt=prompt,
-            stream=False,
-            options=options,
-            keep_alive=0,
+            model=model, prompt=prompt, stream=False,
+            options={"temperature": 0.1, "num_ctx": 4096}, keep_alive=0,
         )
         return str(resp.get("response", "")).strip()
     except Exception:
-        return _generate_fallback_report()
+        try:
+            completed = subprocess.run(
+                ["ollama", "run", model],
+                input=prompt.encode(),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=30, check=True,
+            )
+            return completed.stdout.decode(errors="replace").strip()
+        except Exception:
+            return ""
     finally:
-        subprocess.run(["ollama", "stop", model], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["ollama", "stop", model],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def _generate_fallback_report() -> str:
-    """Return basic analysis report when Ollama is unavailable."""
-    return """# Data Analysis Report
+# ---------------------------------------------------------------------------
+# Analysis helpers
+# ---------------------------------------------------------------------------
 
-## Overview
-Automated analysis report generated from the provided dataset.
-
-## Summary
-- Data pipeline completed successfully
-- Dataset processed through all analysis stages
-- Note: Detailed LLM analysis unavailable (Ollama not running)
-
-## Conclusions
-✓ Data pipeline completed
-✓ Fallback mode active
-
-## Recommendations
-For advanced LLM-powered analysis, ensure Ollama is installed and running with required models."""
-
-
-def _json_from_text(text: str) -> dict[str, Any]:
-    text = text.strip()
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = text[start : end + 1]
-        obj = json.loads(candidate)
-        if isinstance(obj, dict):
-            return obj
-
-    raise UnsafeModelOutputError("Model output was not valid JSON.")
-
-
-def _describe_markdown(df: pd.DataFrame) -> str:
-    # Describe numeric columns for stable, interpretable validation.
-    num = df.select_dtypes(include=[np.number])
-    if num.empty:
-        return "No numeric columns available for df.describe()."
-    desc = num.describe().T
-    desc.index.name = "column"
-    return desc.to_markdown(floatfmt=".6g")
-
-
-def _correlation_summary(df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
-    num = df.select_dtypes(include=[np.number])
-    if num.shape[1] < 2:
-        corr = pd.DataFrame()
-        return corr, []
-
-    corr = num.corr(numeric_only=True)
-    pairs: list[dict[str, Any]] = []
-    cols = list(corr.columns)
-    for i in range(len(cols)):
-        for j in range(i + 1, len(cols)):
-            r = float(corr.iloc[i, j])
-            pairs.append({"col_a": str(cols[i]), "col_b": str(cols[j]), "pearson_r": r, "abs_r": abs(r)})
-    pairs.sort(key=lambda x: x["abs_r"], reverse=True)
-    return corr, pairs[:25]
-
-
-def _strength_from_r(r: float) -> CorrelationStrength:
+def _strength(r: float) -> CorrelationStrength:
     ar = abs(r)
     if ar >= 0.7:
         return "strong"
@@ -179,187 +206,487 @@ def _strength_from_r(r: float) -> CorrelationStrength:
     return "weak"
 
 
-def _direction_from_r(r: float) -> CorrelationDirection:
+def _direction(r: float) -> CorrelationDirection:
     return "positive" if r >= 0 else "negative"
 
 
-def _extract_image_metadata(paths: list[Path]) -> list[ImageMetadata]:
-    out: list[ImageMetadata] = []
-    for p in paths:
-        with Image.open(p) as img:
-            dpi = img.info.get("dpi")
-            dpi_x: float | None = None
-            dpi_y: float | None = None
-            if isinstance(dpi, tuple) and len(dpi) == 2:
-                try:
-                    dpi_x = float(dpi[0])
-                    dpi_y = float(dpi[1])
-                except Exception:
-                    dpi_x = None
-                    dpi_y = None
-            out.append(
-                ImageMetadata(
-                    path=str(p),
-                    width_px=int(img.size[0]),
-                    height_px=int(img.size[1]),
-                    dpi_x=dpi_x,
-                    dpi_y=dpi_y,
+def _trend(series: pd.Series) -> str | None:
+    """Detect monotonic trend via Spearman rank correlation with index."""
+    s = series.dropna().reset_index(drop=True)
+    if len(s) < 5:
+        return None
+    try:
+        from scipy.stats import spearmanr  # type: ignore
+        r, p = spearmanr(range(len(s)), s)
+        if p > 0.05:
+            return "flat"
+        if r > 0.3:
+            return "increasing"
+        if r < -0.3:
+            return "decreasing"
+        return "flat"
+    except ImportError:
+        # Fallback: simple first/last half mean comparison
+        first_half  = float(s[: len(s) // 2].mean())
+        second_half = float(s[len(s) // 2 :].mean())
+        diff = second_half - first_half
+        if abs(diff) < 0.05 * (abs(first_half) + 1e-9):
+            return "flat"
+        return "increasing" if diff > 0 else "decreasing"
+
+
+def _iqr_outliers(series: pd.Series) -> tuple[list[int], float, float]:
+    """
+    Return (outlier_row_indices, lower_fence, upper_fence).
+    Returns empty list and (0.0, 0.0) if the series has fewer than 4 non-NaN values.
+    """
+    s = series.dropna()
+
+    # Guard: need at least 4 values to compute meaningful quartiles
+    if len(s) < 4:
+        return [], 0.0, 0.0
+
+    q1  = float(s.quantile(0.25))
+    q3  = float(s.quantile(0.75))
+    iqr = q3 - q1
+    lo  = q1 - 1.5 * iqr
+    hi  = q3 + 1.5 * iqr
+    mask = (series < lo) | (series > hi)
+    return list(series[mask].index.astype(int)), lo, hi
+
+
+def _compute_column_stats(df: pd.DataFrame) -> list[ColumnStats]:
+    stats: list[ColumnStats] = []
+    for col in df.columns:
+        series = df[col]
+        missing     = int(series.isna().sum())
+        missing_pct = round(missing / len(df) * 100, 2) if len(df) else 0.0
+
+        if pd.api.types.is_numeric_dtype(series):
+            s = series.dropna()
+            outlier_idx, lo, hi = _iqr_outliers(series)
+            stats.append(ColumnStats(
+                column=col,
+                dtype=str(series.dtype),
+                mean=round(float(s.mean()), 6)             if len(s) else None,
+                median=round(float(s.median()), 6)         if len(s) else None,
+                std=round(float(s.std()), 6)               if len(s) else None,
+                min=round(float(s.min()), 6)               if len(s) else None,
+                max=round(float(s.max()), 6)               if len(s) else None,
+                q1=round(float(s.quantile(0.25)), 6)       if len(s) else None,
+                q3=round(float(s.quantile(0.75)), 6)       if len(s) else None,
+                missing_count=missing,
+                missing_pct=missing_pct,
+                outlier_count=len(outlier_idx),
+                trend=_trend(series),
+            ))
+        else:
+            stats.append(ColumnStats(
+                column=col,
+                dtype=str(series.dtype),
+                missing_count=missing,
+                missing_pct=missing_pct,
+            ))
+    return stats
+
+
+def _compute_correlations(df: pd.DataFrame) -> list[CorrelationPair]:
+    num = df.select_dtypes(include=[np.number])
+    if num.shape[1] < 2:
+        return []
+
+    corr = num.corr(numeric_only=True)
+    pairs: list[CorrelationPair] = []
+    cols = list(corr.columns)
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            r = float(corr.iloc[i, j])
+            if np.isnan(r):
+                continue
+            pairs.append(CorrelationPair(
+                col_a=cols[i],
+                col_b=cols[j],
+                pearson_r=round(r, 6),
+                strength=_strength(r),
+                direction=_direction(r),
+            ))
+
+    pairs.sort(key=lambda p: abs(p.pearson_r), reverse=True)
+    return pairs[:50]
+
+
+def _compute_categorical_insights(df: pd.DataFrame, top_n: int = 10) -> list[CategoricalInsight]:
+    insights: list[CategoricalInsight] = []
+    cat_cols = df.select_dtypes(exclude=[np.number]).columns
+    for col in cat_cols:
+        vc    = df[col].value_counts(dropna=False)
+        total = len(df)
+        top   = [
+            {"value": str(v), "count": int(c), "pct": round(c / total * 100, 2)}
+            for v, c in vc.head(top_n).items()
+        ]
+        insights.append(CategoricalInsight(
+            column=col,
+            unique_count=int(df[col].nunique(dropna=True)),
+            top_values=top,
+        ))
+    return insights
+
+
+def _compute_anomalies(df: pd.DataFrame) -> list[Anomaly]:
+    anomalies: list[Anomaly] = []
+    for col in df.select_dtypes(include=[np.number]).columns:
+        idx, lo, hi = _iqr_outliers(df[col])
+        if idx:
+            anomalies.append(Anomaly(
+                column=col,
+                row_indices=idx[:100],
+                lower_fence=round(lo, 6),
+                upper_fence=round(hi, 6),
+                outlier_count=len(idx),
+            ))
+    return anomalies
+
+
+def _derive_key_insights(
+    col_stats: list[ColumnStats],
+    correlations: list[CorrelationPair],
+    anomalies: list[Anomaly],
+    df: pd.DataFrame,
+) -> list[str]:
+    """Generate plain-English bullet insights from computed metrics."""
+    insights: list[str] = []
+
+    # Missing data
+    high_missing = [s for s in col_stats if s.missing_pct > 20]
+    if high_missing:
+        cols_str = ", ".join(f"`{s.column}` ({s.missing_pct:.1f}%)" for s in high_missing[:5])
+        insights.append(f"High missingness detected in: {cols_str}.")
+
+    # Strong correlations
+    strong = [c for c in correlations if c.strength == "strong"]
+    if strong:
+        top = strong[0]
+        insights.append(
+            f"Strongest correlation: `{top.col_a}` ↔ `{top.col_b}` "
+            f"(r={top.pearson_r:+.3f}, {top.direction})."
+        )
+    if len(strong) > 1:
+        insights.append(f"{len(strong)} strong correlation pair(s) found — potential multicollinearity.")
+
+    # Trends
+    increasing = [s.column for s in col_stats if s.trend == "increasing"]
+    decreasing = [s.column for s in col_stats if s.trend == "decreasing"]
+    if increasing:
+        insights.append(f"Upward trend detected in: {', '.join(f'`{c}`' for c in increasing[:5])}.")
+    if decreasing:
+        insights.append(f"Downward trend detected in: {', '.join(f'`{c}`' for c in decreasing[:5])}.")
+
+    # Outliers
+    heavy_outliers = sorted(anomalies, key=lambda a: a.outlier_count, reverse=True)
+    if heavy_outliers:
+        top_a = heavy_outliers[0]
+        insights.append(
+            f"Most outlier-heavy column: `{top_a.column}` "
+            f"({top_a.outlier_count} outlier(s) outside "
+            f"[{top_a.lower_fence:.3g}, {top_a.upper_fence:.3g}])."
+        )
+
+    # Skewness
+    for s in col_stats:
+        if s.mean is not None and s.median is not None and s.std and s.std > 0:
+            skew = (s.mean - s.median) / s.std
+            if abs(skew) > 0.5:
+                direction = "right" if skew > 0 else "left"
+                insights.append(
+                    f"`{s.column}` appears {direction}-skewed "
+                    f"(mean−median / std ≈ {skew:+.2f})."
                 )
-            )
-    return out
+
+    if not insights:
+        insights.append("No strong patterns detected — data appears uniformly distributed.")
+
+    return insights
 
 
-def _build_prompt(
+# ---------------------------------------------------------------------------
+# Optional LLM enrichment
+# ---------------------------------------------------------------------------
+
+def _llm_enrich_insights(
+    key_insights: list[str],
     describe_md: str,
-    top_corr_pairs: list[dict[str, Any]],
-    image_meta: list[ImageMetadata],
-) -> str:
-    image_meta_json = json.dumps([m.__dict__ for m in image_meta], ensure_ascii=False, indent=2)
-    top_corr_json = json.dumps(top_corr_pairs, ensure_ascii=False, indent=2)
+    model: str,
+    host: str,
+) -> list[str]:
+    if not _ollama_alive(host):
+        return key_insights
 
-    return (
-        "You are a validation and synthesis agent preparing a formal research report.\n"
-        "You must be skeptical and verify statements against the provided numeric summaries.\n"
-        "Return STRICT JSON ONLY (no markdown fences, no commentary) with keys:\n"
-        '- "analysis_markdown": string (formal Markdown research report)\n'
-        '- "claims": array of objects, each:\n'
-        '  {"type":"correlation","col_a":string,"col_b":string,"direction":"positive|negative","strength":"weak|moderate|strong"}\n\n'
-        "Constraints:\n"
-        "- Do NOT invent values.\n"
-        "- Any correlation claim must be consistent with the provided correlation pairs.\n"
-        "- In analysis_markdown, include a header:\n"
-        "  - If consistent: '## Data Integrity: Verified'\n"
-        "  - If inconsistent: '## Numerical Discrepancies' (with bullet list)\n\n"
-        "Inputs:\n\n"
-        "### df.describe() (numeric)\n"
-        f"{describe_md}\n\n"
-        "### Top Pearson correlation pairs (absolute value descending)\n"
-        f"{top_corr_json}\n\n"
-        "### Phase 3 image metadata\n"
-        f"{image_meta_json}\n"
+    prompt = (
+        "You are a data analyst. Based on the statistics and existing insights below, "
+        "add 2-3 additional plain-English bullet-point insights. "
+        "Return ONLY a JSON array of strings. No markdown, no preamble.\n\n"
+        "Existing insights:\n"
+        + json.dumps(key_insights, ensure_ascii=False)
+        + "\n\ndf.describe() (numeric columns):\n"
+        + describe_md
     )
 
+    raw = _ollama_generate(model=model, prompt=prompt, host=host)
+    if not raw:
+        return key_insights
 
-def _validate_claims_against_data(
-    claims: list[CorrelationClaim],
-    corr_df: pd.DataFrame,
-) -> list[str]:
-    discrepancies: list[str] = []
-    if corr_df.empty and claims:
-        discrepancies.append("Correlation claims were made, but the dataset has fewer than 2 numeric columns.")
-        return discrepancies
+    try:
+        start = raw.find("[")
+        end   = raw.rfind("]")
+        if start != -1 and end != -1:
+            extras = json.loads(raw[start: end + 1])
+            if isinstance(extras, list):
+                return key_insights + [str(x) for x in extras if isinstance(x, str)]
+    except Exception:
+        pass
 
-    for c in claims:
-        a = c.col_a
-        b = c.col_b
-        if a not in corr_df.columns or b not in corr_df.columns:
-            discrepancies.append(f"Claim references missing column(s): ({a}, {b}).")
-            continue
+    return key_insights
 
-        r = float(corr_df.loc[a, b])
-        expected_dir = _direction_from_r(r)
-        expected_strength = _strength_from_r(r)
 
-        if c.direction != expected_dir:
-            discrepancies.append(f"Direction mismatch for ({a}, {b}): claimed {c.direction}, observed {expected_dir} (r={r:.3g}).")
+# ---------------------------------------------------------------------------
+# Report builder
+# ---------------------------------------------------------------------------
 
-        # Strength check: allow conservative claims (claim weaker than observed),
-        # but flag overstatement (claim stronger than observed).
-        order = {"weak": 0, "moderate": 1, "strong": 2}
-        if order[c.strength] > order[expected_strength]:
-            discrepancies.append(
-                f"Strength overstated for ({a}, {b}): claimed {c.strength}, observed {expected_strength} (r={r:.3g})."
+def _build_markdown_report(result: AnalysisResult) -> str:
+    lines: list[str] = [
+        "# Data Analysis Report",
+        "",
+        f"**Source:** {result.source}  ",
+        f"**Type:** {result.source_type}  ",
+        f"**Rows:** {result.num_rows:,}  |  **Columns:** {result.num_columns}  ",
+        f"**Generated:** {result.timestamp}",
+        "",
+        "---",
+        "",
+        "## Key Insights",
+        "",
+    ]
+    for insight in result.key_insights:
+        lines.append(f"- {insight}")
+
+    lines += ["", "---", "", "## Numeric Column Statistics", ""]
+    num_stats = [s for s in result.column_stats if s.mean is not None]
+    if num_stats:
+        lines.append("| Column | Mean | Median | Std | Min | Max | Outliers | Trend |")
+        lines.append("|--------|------|--------|-----|-----|-----|----------|-------|")
+        for s in num_stats:
+            lines.append(
+                f"| `{s.column}` | {s.mean:.4g} | {s.median:.4g} | {s.std:.4g} "
+                f"| {s.min:.4g} | {s.max:.4g} | {s.outlier_count} | {s.trend or '—'} |"
+            )
+    else:
+        lines.append("_No numeric columns found._")
+
+    if result.correlations:
+        lines += ["", "---", "", "## Top Correlations", ""]
+        lines.append("| Column A | Column B | Pearson r | Strength | Direction |")
+        lines.append("|----------|----------|-----------|----------|-----------|")
+        for c in result.correlations[:15]:
+            lines.append(
+                f"| `{c.col_a}` | `{c.col_b}` | {c.pearson_r:+.4f} "
+                f"| {c.strength} | {c.direction} |"
             )
 
-    return discrepancies
+    if result.anomalies:
+        lines += ["", "---", "", "## Anomalies (IQR Method)", ""]
+        lines.append("| Column | Outlier Count | Lower Fence | Upper Fence |")
+        lines.append("|--------|--------------|-------------|-------------|")
+        for a in sorted(result.anomalies, key=lambda x: x.outlier_count, reverse=True):
+            lines.append(
+                f"| `{a.column}` | {a.outlier_count} "
+                f"| {a.lower_fence:.4g} | {a.upper_fence:.4g} |"
+            )
 
+    if result.categorical_insights:
+        lines += ["", "---", "", "## Categorical Columns", ""]
+        for ci in result.categorical_insights:
+            lines.append(f"### `{ci.column}` ({ci.unique_count} unique values)")
+            lines.append("| Value | Count | % |")
+            lines.append("|-------|-------|---|")
+            for tv in ci.top_values[:5]:
+                sanitized_value = _sanitize_for_markdown(tv['value'])
+                lines.append(f"| {sanitized_value} | {tv['count']} | {tv['pct']}% |")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Enriched DataFrame builder
+# ---------------------------------------------------------------------------
+
+def _enrich_dataframe(df: pd.DataFrame, anomalies: list[Anomaly]) -> pd.DataFrame:
+    """Add a boolean `_is_outlier` column flagging any IQR-outlier row."""
+    outlier_rows: set[int] = set()
+    for a in anomalies:
+        outlier_rows.update(a.row_indices)
+    df = df.copy()
+    df["_is_outlier"] = df.index.isin(outlier_rows)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Core analysis runner  (importable by graph.py / Streamlit)
+# ---------------------------------------------------------------------------
+
+def run_analysis(
+    cleaned_csv_path: Path,
+    *,
+    out_dir: Path | None = None,
+    model: str = "llama3.2:3b",
+    ollama_host: str = "http://127.0.0.1:11434",
+    use_llm: bool = False,
+    source: str = "",
+    source_type: str = "csv",
+) -> dict[str, Any]:
+    """
+    Main analysis pipeline. Returns the phase3_summary dict.
+
+    Parameters
+    ----------
+    cleaned_csv_path : path to cleaned_data.csv from the Labeler Agent
+    out_dir          : where to write outputs; defaults to cleaned_csv_path's parent
+    model            : Ollama model for optional insight enrichment
+    ollama_host      : Ollama base URL
+    use_llm          : whether to call Ollama for extra insight bullets
+    source           : original data source label (forwarded from scout)
+    source_type      : original source type (forwarded from scout)
+    """
+    df = pd.read_csv(cleaned_csv_path)
+    if df.empty:
+        raise RuntimeError("Cleaned CSV is empty — nothing to analyse.")
+
+    print(f"[analyst] Loaded {len(df):,} rows × {len(df.columns)} columns from cleaned_data.csv", flush=True)
+
+    # ── Drop pipeline-internal columns before any analysis ───────────────
+    df = _drop_internal_cols(df)
+
+    run_dir = out_dir or cleaned_csv_path.parent
+    _ensure_dir(run_dir)
+
+    # ── Pull source info from phase2_summary if not supplied ─────────────
+    if not source:
+        summary_path = cleaned_csv_path.parent / "phase2_summary.json"
+        if summary_path.exists():
+            try:
+                phase2 = _read_json(summary_path)
+                source      = phase2.get("source", str(cleaned_csv_path))
+                source_type = phase2.get("source_type", "csv")
+            except Exception:
+                source = str(cleaned_csv_path)
+
+    numeric_cols     = list(df.select_dtypes(include=[np.number]).columns)
+    categorical_cols = list(df.select_dtypes(exclude=[np.number]).columns)
+
+    col_stats    = _compute_column_stats(df)
+    correlations = _compute_correlations(df)
+    cat_insights = _compute_categorical_insights(df)
+    anomalies    = _compute_anomalies(df)
+    key_insights = _derive_key_insights(col_stats, correlations, anomalies, df)
+
+    # ── Optional LLM enrichment ──────────────────────────────────────────
+    if use_llm:
+        num = df.select_dtypes(include=[np.number])
+        describe_md = num.describe().T.to_markdown(floatfmt=".4g") if not num.empty else ""
+        key_insights = _llm_enrich_insights(
+            key_insights, describe_md, model=model, host=ollama_host
+        )
+
+    result = AnalysisResult(
+        source=source or str(cleaned_csv_path),
+        source_type=source_type,
+        num_rows=len(df),
+        num_columns=len(df.columns),
+        numeric_columns=numeric_cols,
+        categorical_columns=categorical_cols,
+        column_stats=col_stats,
+        correlations=correlations,
+        categorical_insights=cat_insights,
+        anomalies=anomalies,
+        key_insights=key_insights,
+    )
+
+    # ── Write outputs ────────────────────────────────────────────────────
+    result_dict = result.model_dump()
+    _write_json(run_dir / "analysis_result.json", result_dict)
+    _write_text(run_dir / "analysis_report.md", _build_markdown_report(result))
+
+    enriched      = _enrich_dataframe(df, anomalies)
+    enriched_path = run_dir / "enriched_data.csv"
+    enriched.to_csv(enriched_path, index=False)
+
+    summary = {
+        "source": result.source,
+        "source_type": result.source_type,
+        "num_rows": result.num_rows,
+        "num_columns": result.num_columns,
+        "numeric_columns": numeric_cols,
+        "categorical_columns": categorical_cols,
+        "correlation_pairs_found": len(correlations),
+        "anomaly_columns": [a.column for a in anomalies],
+        "key_insights": key_insights,
+        "analysis_result_json": str(run_dir / "analysis_result.json"),
+        "analysis_report_md": str(run_dir / "analysis_report.md"),
+        "enriched_data_csv": str(enriched_path),
+    }
+    _write_json(run_dir / "phase3_summary.json", summary)
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main() -> int:
-    # Load environment from explicit backend/.env path
     env_file = Path(__file__).parent.parent / ".env"
     load_dotenv(dotenv_path=env_file)
 
-    parser = argparse.ArgumentParser(description="Phase 4 Analyst: verified synthesis with local Llama 3 8B.")
-    parser.add_argument("cleaned_csv", help="Path to cleaned CSV (e.g., cleaned_research_data.csv or cleaned_data.csv)")
+    parser = argparse.ArgumentParser(
+        description="Data Analysis Agent (Phase 3): statistics, correlations, anomalies."
+    )
     parser.add_argument(
-        "--phase3-dir",
-        default=None,
-        help="Directory containing Phase 3 outputs (expects .png files). If omitted, only data checks run.",
+        "cleaned_csv",
+        help="Path to cleaned_data.csv produced by the Labeler Agent.",
     )
     parser.add_argument(
         "--model",
-        default=os.getenv("OLLAMA_PHASE4_MODEL", "llama3:8b"),
-        help="Ollama model for Phase 4 (default: env OLLAMA_PHASE4_MODEL or llama3:8b)",
+        default=os.getenv("OLLAMA_PHASE3_MODEL", "llama3.2:3b"),
     )
     parser.add_argument(
         "--ollama-host",
         default=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
-        help="Ollama host URL (default: env OLLAMA_HOST or http://127.0.0.1:11434)",
     )
-    parser.add_argument("--out-dir", default="runs", help="Output directory under backend/ (default: runs)")
+    parser.add_argument(
+        "--use-llm", action="store_true",
+        help="Enable Ollama for additional plain-English insight bullets.",
+    )
+    parser.add_argument("--source", default="")
+    parser.add_argument("--source-type", default="csv")
+    parser.add_argument("--out-dir", default=None)
     args = parser.parse_args()
 
-    cleaned_path = Path(args.cleaned_csv)
-    if not cleaned_path.exists():
-        raise FileNotFoundError(str(cleaned_path))
+    csv_path = Path(args.cleaned_csv)
+    if not csv_path.exists():
+        raise FileNotFoundError(str(csv_path))
 
-    df = pd.read_csv(cleaned_path)
-    if df.empty:
-        raise RuntimeError("Cleaned CSV contained no rows.")
+    out_dir = Path(args.out_dir) if args.out_dir else None
 
-    describe_md = _describe_markdown(df)
-    corr_df, top_pairs = _correlation_summary(df)
+    summary = run_analysis(
+        cleaned_csv_path=csv_path,
+        out_dir=out_dir,
+        model=args.model,
+        ollama_host=args.ollama_host,
+        use_llm=args.use_llm,
+        source=args.source,
+        source_type=args.source_type,
+    )
 
-    image_meta: list[ImageMetadata] = []
-    if args.phase3_dir:
-        p3 = Path(args.phase3_dir)
-        if not p3.exists():
-            raise FileNotFoundError(str(p3))
-        pngs = sorted(p3.glob("*.png"))
-        if pngs:
-            image_meta = _extract_image_metadata(pngs)
-
-    prompt = _build_prompt(describe_md=describe_md, top_corr_pairs=top_pairs, image_meta=image_meta)
-    model_text = _ollama_generate(model=args.model, prompt=prompt, host=args.ollama_host)
-
-    obj = _json_from_text(model_text)
-    try:
-        model_out = Phase4ModelOutput.model_validate(obj)
-    except ValidationError as e:
-        raise UnsafeModelOutputError(f"Model JSON did not match required schema: {e}") from e
-
-    discrepancies = _validate_claims_against_data(model_out.claims, corr_df)
-
-    run_ts = dt.datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_dir = Path("backend") / args.out_dir / f"{run_ts}_{_safe_slug(cleaned_path.stem)}"
-    _ensure_dir(run_dir)
-
-    _write_text(run_dir / "phase4_prompt.txt", prompt)
-    _write_text(run_dir / "phase4_model_raw.txt", model_text)
-    _write_json(run_dir / "phase4_model_output.json", model_out.model_dump())
-
-    # Final report: if we found discrepancies, prepend a formal section.
-    report = model_out.analysis_markdown.strip()
-    if discrepancies and "## Numerical Discrepancies" not in report:
-        report = (
-            "## Numerical Discrepancies\n"
-            + "\n".join([f"- {d}" for d in discrepancies])
-            + "\n\n"
-            + report
-        )
-    if (not discrepancies) and "## Data Integrity: Verified" not in report:
-        report = "## Data Integrity: Verified\n\n" + report
-
-    report_path = run_dir / "research_report.md"
-    _write_text(report_path, report + "\n")
-
-    summary = {
-        "input_csv": str(cleaned_path),
-        "phase3_dir": args.phase3_dir,
-        "report_md": str(report_path),
-        "discrepancy_count": len(discrepancies),
-    }
-    _write_json(run_dir / "phase4_summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 
@@ -369,4 +696,3 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except KeyboardInterrupt:
         raise SystemExit(130)
-

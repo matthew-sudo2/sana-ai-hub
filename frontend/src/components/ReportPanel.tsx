@@ -7,6 +7,31 @@ const ReportPanel = () => {
   const { reportContent, isLoading, phase, runId } = usePipeline();
   const { toast } = useToast();
 
+  /**
+   * Sanitize report content by removing or escaping problematic characters
+   * that might cause rendering issues in markdown
+   */
+  const sanitizeReportContent = (content: string): string => {
+    if (!content) return "";
+    
+    // Normalize line endings FIRST (before any character removal)
+    let sanitized = content.replace(/\r\n/g, "\n");
+    
+    // Remove ONLY problematic control characters, but PRESERVE newlines (ASCII 10) and tabs (ASCII 9)
+    // Characters to remove: 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F, and 0x7F
+    sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+    
+    // Fix common encoding issues
+    sanitized = sanitized
+      .replace(/\u202E/g, "")   // Remove right-to-left override
+      .replace(/\u202D/g, "")   // Remove left-to-right override
+      .replace(/\u200B/g, "")   // Remove zero-width space
+      .replace(/\u200C/g, "")   // Remove zero-width non-joiner
+      .replace(/\u200D/g, "");  // Remove zero-width joiner
+    
+    return sanitized;
+  };
+
   const handleCopy = () => {
     if (reportContent) {
       navigator.clipboard.writeText(reportContent);
@@ -34,6 +59,7 @@ const ReportPanel = () => {
   };
 
   const isComplete = phase === "complete";
+  const cleanContent = sanitizeReportContent(reportContent || "");
 
   return (
     <div className="flex h-full flex-col">
@@ -49,7 +75,7 @@ const ReportPanel = () => {
         )}
       </div>
 
-      <div className="flex-1 overflow-auto p-5">
+      <div className="flex-1 overflow-auto p-5 bg-background">
         {isLoading || !reportContent ? (
           <div className="flex h-full items-center justify-center">
             <div className="text-center">
@@ -68,34 +94,45 @@ const ReportPanel = () => {
             </div>
           </div>
         ) : (
-          <div className="rounded-md border bg-card p-6 shadow-sm prose prose-sm dark:prose-invert max-w-none">
+          <div className="rounded-md border bg-card p-6 shadow-sm prose prose-sm dark:prose-invert max-w-none overflow-x-auto">
             <ReactMarkdown
               components={{
                 h1: ({ node, ...props }) => (
-                  <h1 className="font-display text-lg font-bold text-foreground mb-4" {...props} />
+                  <h1 className="font-display text-lg font-bold text-foreground mb-4 break-words" {...props} />
                 ),
                 h2: ({ node, ...props }) => (
-                  <h2 className="font-display text-base font-bold text-foreground mt-4 mb-2" {...props} />
+                  <h2 className="font-display text-base font-bold text-foreground mt-4 mb-2 break-words" {...props} />
                 ),
                 h3: ({ node, ...props }) => (
-                  <h3 className="font-display text-sm font-semibold text-foreground mt-3 mb-1" {...props} />
+                  <h3 className="font-display text-sm font-semibold text-foreground mt-3 mb-1 break-words" {...props} />
                 ),
-                p: ({ node, ...props }) => <p className="text-sm leading-relaxed mb-3" {...props} />,
+                p: ({ node, ...props }) => <p className="text-sm leading-relaxed mb-3 break-words" {...props} />,
                 ul: ({ node, ...props }) => <ul className="list-disc list-inside space-y-1 mb-3" {...props} />,
                 ol: ({ node, ...props }) => <ol className="list-decimal list-inside space-y-1 mb-3" {...props} />,
-                li: ({ node, ...props }) => <li className="text-sm" {...props} />,
+                li: ({ node, ...props }) => <li className="text-sm break-words" {...props} />,
                 code: ({ node, inline, ...props }) =>
                   inline ? (
-                    <code className="bg-muted px-1.5 py-0.5 rounded text-xs font-mono" {...props} />
+                    <code className="bg-muted px-1.5 py-0.5 rounded text-xs font-mono break-words" {...props} />
                   ) : (
-                    <code className="bg-muted p-3 rounded block text-xs font-mono overflow-auto mb-3" {...props} />
+                    <code className="bg-muted p-3 rounded block text-xs font-mono overflow-auto mb-3 break-words" {...props} />
                   ),
+                table: ({ node, ...props }) => (
+                  <div className="overflow-x-auto mb-3">
+                    <table className="w-full text-sm border-collapse" {...props} />
+                  </div>
+                ),
+                td: ({ node, ...props }) => (
+                  <td className="border border-muted px-2 py-1 text-xs break-words" {...props} />
+                ),
+                th: ({ node, ...props }) => (
+                  <th className="border border-muted bg-muted px-2 py-1 text-xs font-semibold break-words" {...props} />
+                ),
                 blockquote: ({ node, ...props }) => (
-                  <blockquote className="border-l-4 border-success pl-4 text-sm italic my-3" {...props} />
+                  <blockquote className="border-l-4 border-success pl-4 text-sm italic my-3 break-words" {...props} />
                 ),
               }}
             >
-              {reportContent}
+              {cleanContent}
             </ReactMarkdown>
           </div>
         )}

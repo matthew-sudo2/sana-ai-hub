@@ -63,6 +63,20 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _sanitize_detail(detail: str) -> str:
+    """Sanitize detail text for safe markdown rendering."""
+    if not detail:
+        return ""
+    # Convert Windows paths to forward slashes for better markdown rendering
+    detail = detail.replace("\\", "/")
+    # Remove special markdown characters or escape them
+    detail = detail.replace("|", "•")  # Replace pipes with bullets
+    detail = detail.replace("[", "(").replace("]", ")")  # Replace brackets with parens
+    # Clean up Python list/dict representations
+    detail = detail.replace("'", "")  # Remove single quotes from list repr
+    return detail.strip()
+
+
 def _check(
     check_id: str,
     category: str,
@@ -77,7 +91,7 @@ def _check(
         description=description,
         passed=passed,
         severity=severity,
-        detail=detail,
+        detail=_sanitize_detail(detail),
     )
 
 
@@ -278,37 +292,63 @@ def _derive_status(confidence: float, checks: list[CheckResult]) -> Status:
 
 
 def _build_report(result: ValidationResult) -> str:
+    """
+    Build a clean, compact validation report in markdown format.
+    Focus on readability with only essential information highlighted.
+    """
     lines = [
         "# Validation Report",
         "",
-        "## Summary",
-        f"- **Status:** {result.status}",
-        f"- **Overall Confidence:** {result.overall_confidence:.1%}",
-        f"- **Source:** `{result.source}`",
-        f"- **Type:** {result.source_type}",
-        f"- **Rows / Columns:** {result.num_rows} / {result.num_columns}",
-        f"- **Charts Validated:** {result.charts_validated}",
-        f"- **Generated:** {result.timestamp}",
+        f"**Status:** {result.status} | **Confidence:** {result.overall_confidence:.1%}",
         "",
-        "## Dimension Scores",
     ]
-
+    
+    # Summary metrics in a concise format
+    lines += [
+        "## Dataset Information",
+        f"- Rows: {result.num_rows:,} | Columns: {result.num_columns}",
+        f"- Source: {result.source}",
+        f"- Charts Validated: {result.charts_validated}",
+        "",
+    ]
+    
+    # Quality scores by dimension
+    lines += ["## Quality Scores"]
     for d in result.dimension_scores:
-        lines.append(f"- {d.dimension}: {d.score:.1%} (weight {d.weight:.0%}, {d.checks_passed}/{d.checks_total})")
-
-    if result.errors:
-        lines += ["", "## Blocking Errors"]
-        lines.extend([f"- {x}" for x in result.errors])
-
-    if result.warnings:
-        lines += ["", "## Warnings"]
-        lines.extend([f"- {x}" for x in result.warnings])
-
-    lines += ["", "## Check Details"]
+        status_icon = "✓" if d.score >= 0.9 else "⚠" if d.score >= 0.75 else "✗"
+        lines.append(f"**{status_icon} {d.dimension.title()}:** {d.score:.1%} ({d.checks_passed}/{d.checks_total} passed)")
+    lines.append("")
+    
+    # Group checks by category and show only failures
+    failed_by_category = {}
     for c in result.checks:
-        marker = "PASS" if c.passed else "FAIL"
-        detail = f" ({c.detail})" if c.detail else ""
-        lines.append(f"- **{marker}** | `{c.category}` | `{c.severity}` | {c.description}{detail}")
+        if not c.passed:
+            if c.category not in failed_by_category:
+                failed_by_category[c.category] = []
+            failed_by_category[c.category].append(c)
+    
+    if failed_by_category:
+        lines += ["## Issues Found"]
+        for category in sorted(failed_by_category.keys()):
+            checks = failed_by_category[category]
+            lines.append(f"### {category.title()} ({len(checks)} issue{'s' if len(checks) != 1 else ''})")
+            for check in checks:
+                severity = "🔴" if check.severity == "error" else "🟡" if check.severity == "warning" else "ℹ️"
+                detail = f" — {check.detail}" if check.detail else ""
+                lines.append(f"- {severity} {check.description}{detail}")
+            lines.append("")
+    else:
+        lines += ["", "✅ All validation checks passed!"]
+    
+    # Summary statistics
+    total_checks = len(result.checks)
+    passed_checks = sum(1 for c in result.checks if c.passed)
+    lines += [
+        "",
+        "---",
+        f"**Validation Complete:** {passed_checks}/{total_checks} checks passed",
+        f"**Generated:** {result.timestamp}",
+    ]
 
     return "\n".join(lines)
 

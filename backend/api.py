@@ -133,9 +133,9 @@ async def start_pipeline(
     state = get_run(run_id)
     return RunResponse(
         run_id=run_id,
-        phase=state.phase,
-        status=state.status,
-        error=state.error,
+        phase=state["phase"] if state else None,
+        status=state["status"] if state else None,
+        error=state["error"] if state else None,
     )
 
 
@@ -172,9 +172,9 @@ async def start_pipeline_json(request: RunRequest) -> RunResponse:
     state = get_run(run_id)
     return RunResponse(
         run_id=run_id,
-        phase=state.phase,
-        status=state.status,
-        error=state.error,
+        phase=state["phase"] if state else None,
+        status=state["status"] if state else None,
+        error=state["error"] if state else None,
     )
 
 
@@ -194,15 +194,15 @@ async def get_run_status(run_id: str):
     
     return RunResponse(
         run_id=run_id,
-        phase=state.phase,
-        status=state.status,
-        error=state.error,
+        phase=state["phase"],
+        status=state["status"],
+        error=state["error"],
         output_dir=(
-            state.validator_output_dir
-            or state.artist_output_dir
-            or state.analyst_output_dir
-            or state.labeler_output_dir
-            or state.scout_output_dir
+            state["validator_output_dir"]
+            or state["artist_output_dir"]
+            or state["analyst_output_dir"]
+            or state["labeler_output_dir"]
+            or state["scout_output_dir"]
         ),
     )
 
@@ -221,13 +221,13 @@ async def download_csv(run_id: str):
             content={"error": f"Run {run_id} not found"},
         )
     
-    if not state.labeler_output_dir:
+    if not state["labeler_output_dir"]:
         return JSONResponse(
             status_code=202,  # Accepted, not ready yet
             content={"error": "Labeler phase not yet complete"},
         )
     
-    csv_path = Path(state.labeler_output_dir) / "cleaned_data.csv"
+    csv_path = Path(state["labeler_output_dir"]) / "cleaned_data.csv"
     if not csv_path.exists():
         return JSONResponse(
             status_code=404,
@@ -255,13 +255,13 @@ async def list_images(run_id: str):
             content={"error": f"Run {run_id} not found"},
         )
     
-    if not state.artist_output_dir:
+    if not state["artist_output_dir"]:
         return JSONResponse(
             status_code=202,
             content={"images": [], "message": "Artist phase not yet complete"},
         )
     
-    output_dir = Path(state.artist_output_dir)
+    output_dir = Path(state["artist_output_dir"])
     pngs = sorted([f.name for f in output_dir.glob("*.png")])
     
     return JSONResponse(
@@ -287,13 +287,13 @@ async def download_image(run_id: str, filename: str):
         )
     
     state = get_run(run_id)
-    if not state or not state.artist_output_dir:
+    if not state or not state["artist_output_dir"]:
         return JSONResponse(
             status_code=404,
             content={"error": f"Run {run_id} or output not found"},
         )
     
-    image_path = Path(state.artist_output_dir) / filename
+    image_path = Path(state["artist_output_dir"]) / filename
     if not image_path.exists() or not image_path.suffix.lower() == ".png":
         return JSONResponse(
             status_code=404,
@@ -322,11 +322,11 @@ async def get_report(run_id: str):
         )
     
     output_dir = (
-        state.validator_output_dir
-        or state.artist_output_dir
-        or state.analyst_output_dir
-        or state.labeler_output_dir
-        or state.scout_output_dir
+        state["validator_output_dir"]
+        or state["artist_output_dir"]
+        or state["analyst_output_dir"]
+        or state["labeler_output_dir"]
+        or state["scout_output_dir"]
     )
     if not output_dir:
         return JSONResponse(
@@ -367,11 +367,11 @@ async def get_validation_result(run_id: str):
         )
 
     output_dir = (
-        state.validator_output_dir
-        or state.artist_output_dir
-        or state.analyst_output_dir
-        or state.labeler_output_dir
-        or state.scout_output_dir
+        state["validator_output_dir"]
+        or state["artist_output_dir"]
+        or state["analyst_output_dir"]
+        or state["labeler_output_dir"]
+        or state["scout_output_dir"]
     )
     if not output_dir:
         return JSONResponse(
@@ -395,18 +395,18 @@ def _read_json_file(path: Path) -> dict[str, Any]:
 
 def _resolve_pipeline_output_dir(state: PipelineState) -> Path | None:
     output_dir = (
-        state.validator_output_dir
-        or state.artist_output_dir
-        or state.analyst_output_dir
-        or state.labeler_output_dir
-        or state.scout_output_dir
+        state["validator_output_dir"]
+        or state["artist_output_dir"]
+        or state["analyst_output_dir"]
+        or state["labeler_output_dir"]
+        or state["scout_output_dir"]
     )
     return Path(output_dir) if output_dir else None
 
 
 def _resolve_cleaned_csv_path(state: PipelineState) -> Path | None:
-    if state.labeler_output_dir:
-        candidate = Path(state.labeler_output_dir) / "cleaned_data.csv"
+    if state["labeler_output_dir"]:
+        candidate = Path(state["labeler_output_dir"]) / "cleaned_data.csv"
         if candidate.exists():
             return candidate
 
