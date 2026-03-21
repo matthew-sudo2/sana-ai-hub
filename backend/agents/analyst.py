@@ -238,21 +238,30 @@ def _trend(series: pd.Series) -> str | None:
 def _iqr_outliers(series: pd.Series) -> tuple[list[int], float, float]:
     """
     Return (outlier_row_indices, lower_fence, upper_fence).
-    Returns empty list and (0.0, 0.0) if the series has fewer than 4 non-NaN values.
+    Returns empty list and (0.0, 0.0) if the series has fewer than 4 non-NaN values
+    or if series is boolean/object dtype.
     """
+    # Guard: skip boolean and object dtypes
+    if series.dtype == 'bool' or series.dtype == 'object':
+        return [], 0.0, 0.0
+    
     s = series.dropna()
 
     # Guard: need at least 4 values to compute meaningful quartiles
     if len(s) < 4:
         return [], 0.0, 0.0
 
-    q1  = float(s.quantile(0.25))
-    q3  = float(s.quantile(0.75))
-    iqr = q3 - q1
-    lo  = q1 - 1.5 * iqr
-    hi  = q3 + 1.5 * iqr
-    mask = (series < lo) | (series > hi)
-    return list(series[mask].index.astype(int)), lo, hi
+    try:
+        q1  = float(s.quantile(0.25))
+        q3  = float(s.quantile(0.75))
+        iqr = q3 - q1
+        lo  = q1 - 1.5 * iqr
+        hi  = q3 + 1.5 * iqr
+        mask = (series < lo) | (series > hi)
+        return list(series[mask].index.astype(int)), lo, hi
+    except (TypeError, ValueError):
+        # Fallback for any remaining type errors
+        return [], 0.0, 0.0
 
 
 def _compute_column_stats(df: pd.DataFrame) -> list[ColumnStats]:
@@ -262,7 +271,10 @@ def _compute_column_stats(df: pd.DataFrame) -> list[ColumnStats]:
         missing     = int(series.isna().sum())
         missing_pct = round(missing / len(df) * 100, 2) if len(df) else 0.0
 
-        if pd.api.types.is_numeric_dtype(series):
+        # Check if numeric but exclude boolean dtypes
+        is_numeric = pd.api.types.is_numeric_dtype(series) and series.dtype != 'bool'
+        
+        if is_numeric:
             s = series.dropna()
             outlier_idx, lo, hi = _iqr_outliers(series)
             stats.append(ColumnStats(
@@ -291,7 +303,9 @@ def _compute_column_stats(df: pd.DataFrame) -> list[ColumnStats]:
 
 
 def _compute_correlations(df: pd.DataFrame) -> list[CorrelationPair]:
+    # Select numeric columns but exclude booleans
     num = df.select_dtypes(include=[np.number])
+    num = num.select_dtypes(exclude=['bool'])  # Exclude boolean columns
     if num.shape[1] < 2:
         return []
 

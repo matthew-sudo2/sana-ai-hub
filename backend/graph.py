@@ -756,13 +756,17 @@ def artist_node(state: PipelineState) -> PipelineState:
         try:
             from .agents.artist import run_visualization
 
+            # OPTIMIZED: use_llm=False by default (builtin charts only).
+            # LLM chart generation can be enabled via environment variable if needed.
+            use_llm_charts = os.getenv("SANA_USE_LLM_CHARTS", "false").lower() == "true"
+            
             run_visualization(
                 enriched_csv_path=enriched_csv,
                 analysis_json_path=analysis_json if analysis_json.exists() else None,
                 out_dir=run_dir,
                 model=os.getenv("OLLAMA_PHASE4_MODEL", "qwen2.5-coder:3b"),
                 ollama_host=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
-                use_llm=False,
+                use_llm=use_llm_charts,
             )
             completed = True
         except Exception:

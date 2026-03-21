@@ -1,25 +1,28 @@
 """
 Labeler Agent — Phase 2
-Receives a ScoutResult JSON (from scout_agent.py), cleans the dataset,
-and produces a seaborn visual report.
+Receives scout_result.json (from scout_agent.py), cleans the FULL dataset,
+and produces cleaned_data.csv + visual_report.png + phase2_summary.json.
 
-Input  : ScoutResult JSON  (is_dataset, columns, dtypes, sample_data,
-                             num_rows, num_columns, source, source_type, …)
-Output : cleaned_data.csv + visual_report.png + phase2_summary.json
+Key fix: reads raw_data.csv (full dataset written by scout) instead of
+         sample_data (5-row preview) or the original upload path.
+
+Data loading priority:
+  1. raw_data.csv in the run directory  ← always the full dataset
+  2. raw_data_path field in scout JSON  ← absolute path fallback
+  3. sample_data from scout JSON        ← last resort (preview only, warns)
 """
 
 from __future__ import annotations
 
 import argparse
-import ast
 import datetime as dt
 from datetime import timezone
+import hashlib
 import json
 import os
 import re
-import subprocess
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
@@ -37,7 +40,7 @@ import seaborn as sns
 class ScoutResult(BaseModel):
     is_dataset: bool
     source: str = Field(min_length=1)
-    source_type: str                        # "url" | "csv" | "xlsx" | "json" | "text"
+    source_type: str                        # "csv" | "xlsx" | "json" | "rejected"
     columns: list[str] = Field(default_factory=list)
     dtypes: dict[str, str] = Field(default_factory=dict)
     num_rows: int = 0
@@ -45,14 +48,11 @@ class ScoutResult(BaseModel):
     sample_data: list[dict[str, Any]] = Field(default_factory=list)
     confidence_score: float = 0.0
     rejection_reason: str | None = None
-    tables_found: int = 0
+    raw_data_path: str | None = None        # absolute path to raw_data.csv on disk
     timestamp: str = ""
 
-    # ------------------------------------------------------------------
-    # Back-compat: accept old Phase1Metadata fields so existing run dirs
-    # still work without re-scouting.
-    # ------------------------------------------------------------------
-    source_url: str | None = None           # old field → maps to source
+    # back-compat fields from old Phase1Metadata shape
+    source_url: str | None = None
     primary_topic: str | None = None
     publication_date: str | None = None
     raw_quantitative_stats: Any = None
@@ -60,83 +60,235 @@ class ScoutResult(BaseModel):
     def effective_source(self) -> str:
         return self.source or self.source_url or "unknown"
 
-    def to_dataframe(self) -> pd.DataFrame:
-        """
-        Build a DataFrame from the scout output using the best available data:
-          1. Full source file for file-based inputs (csv/xlsx/json)
-          2. sample_data  (list-of-dicts from HTML / file scraping)
-          3. raw_quantitative_stats (old Phase1 path)
-          4. Minimal metadata row as last resort
-        """
-        source_path = Path(self.source)
 
-        # ---- Path 1: load full local dataset when available ----
-        if self.source_type in {"csv", "xlsx", "json"} and source_path.exists():
-            if self.source_type == "csv":
-                df = pd.read_csv(source_path)
-            elif self.source_type == "xlsx":
-                df = pd.read_excel(source_path)
-            else:
-                payload = json.loads(source_path.read_text(encoding="utf-8"))
-                df = pd.json_normalize(payload) if isinstance(payload, dict) else pd.DataFrame(payload)
+# ---------------------------------------------------------------------------
+# Deterministic Cleaning Profile (replaces LLM approach)
+# ---------------------------------------------------------------------------
 
-            for col, dtype in self.dtypes.items():
-                if col not in df.columns:
-                    continue
-                if dtype in ("integer", "float", "numeric"):
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-                elif dtype == "datetime":
-                    df[col] = pd.to_datetime(df[col], errors="coerce")
-                elif dtype == "boolean":
-                    df[col] = (
-                        df[col]
-                        .astype(str)
-                        .str.lower()
-                        .map({"true": True, "false": False})
-                        .astype("boolean")
-                    )
-            return df
+class CleaningProfile(BaseModel):
+    """Pre-configured cleaning rules — no LLM dependency needed"""
+    drop_empty_rows: bool = True
+    drop_empty_cols: bool = True
+    drop_duplicates: bool = True
+    standardize_column_names: bool = True
+    auto_detect_dtypes: bool = True
+    fill_missing_strategy: Literal["drop", "ffill", "mean"] = "drop"
+    handle_outliers: bool = False
+    outlier_method: Literal["iqr", "zscore"] = "iqr"
 
-        # ---- Path 1: new scout sample_data ----
-        if self.sample_data:
-            df = pd.DataFrame(self.sample_data)
-            # Apply the dtype hints the scout already inferred
-            for col, dtype in self.dtypes.items():
-                if col not in df.columns:
-                    continue
-                if dtype in ("integer", "float"):
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-                elif dtype == "datetime":
-                    df[col] = pd.to_datetime(df[col], errors="coerce")
-                elif dtype == "boolean":
-                    df[col] = df[col].map(
-                        {"True": True, "False": False, "true": True, "false": False}
-                    ).astype("boolean")
-            return df
 
-        # ---- Path 2: old raw_quantitative_stats ----
-        if self.raw_quantitative_stats is not None:
-            stats = self.raw_quantitative_stats
-            base = {
-                "source": self.effective_source(),
-                "publication_date": self.publication_date,
-                "primary_topic": self.primary_topic,
-            }
-            if isinstance(stats, dict):
-                flat = pd.json_normalize(stats, sep="__")
-                for k, v in base.items():
-                    flat[k] = v
-                return flat
-            return pd.DataFrame([{**base, "raw_quantitative_stats": stats}])
+DEFAULT_CLEANING_PROFILE = CleaningProfile()
 
-        # ---- Path 3: bare metadata row ----
-        return pd.DataFrame([{
-            "source": self.effective_source(),
-            "source_type": self.source_type,
-            "num_rows": self.num_rows,
-            "num_columns": self.num_columns,
-            "confidence_score": self.confidence_score,
-        }])
+
+def _apply_deterministic_cleaning(
+    df: pd.DataFrame, profile: CleaningProfile = DEFAULT_CLEANING_PROFILE
+) -> pd.DataFrame:
+    """Fast, reproducible data cleaning without LLM. Runs in <1 second."""
+
+    # Standardize column names to snake_case
+    if profile.standardize_column_names:
+        df.columns = [
+            re.sub(r'[^a-z0-9]+', '_', str(c).strip().lower()).strip('_')
+            for c in df.columns
+        ]
+
+    # Drop fully empty rows
+    if profile.drop_empty_rows:
+        df = df.dropna(how='all')
+
+    # Drop fully empty columns
+    if profile.drop_empty_cols:
+        df = df.dropna(axis=1, how='all')
+
+    # Remove duplicate rows
+    if profile.drop_duplicates:
+        df = df.drop_duplicates()
+
+    # Handle missing values
+    if profile.fill_missing_strategy == "ffill":
+        df = df.fillna(method="ffill")
+    elif profile.fill_missing_strategy == "mean":
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            df[col].fillna(df[col].mean(), inplace=True)
+
+    # Optional outlier removal
+    if profile.handle_outliers:
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        if profile.outlier_method == "iqr":
+            for col in numeric_cols:
+                Q1, Q3 = df[col].quantile([0.25, 0.75])
+                IQR = Q3 - Q1
+                lower_bound = Q1 - 1.5 * IQR
+                upper_bound = Q3 + 1.5 * IQR
+                df = df[(df[col] >= lower_bound) & (df[col] <= upper_bound)]
+
+    return df
+
+
+def _make_simple_visual_report(
+    df: pd.DataFrame, out_png_path: str, profile: CleaningProfile = DEFAULT_CLEANING_PROFILE
+) -> None:
+    """Fast builtin visualization without LLM. Runs in <2 seconds."""
+    sns.set_theme(style="whitegrid")
+    numeric_cols = df.select_dtypes(include='number').columns.tolist()
+    n = min(len(numeric_cols), 4)
+
+    if n == 0:
+        # No numeric columns—show a placeholder
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(0.5, 0.5, 'No numeric columns to plot', ha='center', va='center', fontsize=14)
+        ax.axis('off')
+    elif n == 1:
+        # Single numeric column—histogram
+        fig, ax = plt.subplots(figsize=(8, 5))
+        sns.histplot(df[numeric_cols[0]].dropna(), bins=20, ax=ax, kde=True)
+        ax.set_title(f'Distribution of {numeric_cols[0]}')
+        ax.set_xlabel(numeric_cols[0])
+        ax.set_ylabel('Frequency')
+    else:
+        # Multiple numeric columns—grid of histograms
+        fig, axes = plt.subplots(1, n, figsize=(5 * n, 5))
+        for i, col in enumerate(numeric_cols[:n]):
+            sns.histplot(df[col].dropna(), bins=20, ax=axes[i], kde=True)
+            axes[i].set_title(f'Distribution of {col}')
+            axes[i].set_xlabel(col)
+            axes[i].set_ylabel('Frequency')
+
+    plt.tight_layout()
+    plt.savefig(out_png_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Caching Layer (optional speedup for large datasets)
+# ---------------------------------------------------------------------------
+
+def _compute_dataframe_hash(df: pd.DataFrame) -> str:
+    """Compute MD5 hash of DataFrame for change detection."""
+    csv_bytes = df.to_csv(index=False).encode('utf-8')
+    return hashlib.md5(csv_bytes).hexdigest()
+
+
+def _get_cache_marker_path(run_dir: Path) -> Path:
+    """Location where we store the data fingerprint."""
+    return run_dir / ".labeler_cache"
+
+
+class CacheMarker(BaseModel):
+    """Tracks if cleaning has already been applied to this dataset."""
+    data_hash: str
+    profile_hash: str
+    timestamp: str
+
+
+def _should_skip_cleaning(
+    df: pd.DataFrame, profile: CleaningProfile, run_dir: Path
+) -> bool:
+    """Check if this exact dataset with this profile was already cleaned."""
+    cache_file = _get_cache_marker_path(run_dir)
+    if not cache_file.exists():
+        return False
+    
+    try:
+        cached = CacheMarker.model_validate_json(cache_file.read_text())
+        current_data_hash = _compute_dataframe_hash(df)
+        current_profile_hash = hashlib.md5(
+            json.dumps(profile.model_dump(), sort_keys=True).encode()
+        ).hexdigest()
+        
+        return (cached.data_hash == current_data_hash and 
+                cached.profile_hash == current_profile_hash)
+    except Exception:
+        return False
+
+
+def _save_cache_marker(
+    df: pd.DataFrame, profile: CleaningProfile, run_dir: Path
+) -> None:
+    """Save the data+profile fingerprints to mark this dataset as cached."""
+    data_hash = _compute_dataframe_hash(df)
+    profile_hash = hashlib.md5(
+        json.dumps(profile.model_dump(), sort_keys=True).encode()
+    ).hexdigest()
+    
+    marker = CacheMarker(
+        data_hash=data_hash,
+        profile_hash=profile_hash,
+        timestamp=dt.datetime.now(timezone.utc).isoformat(),
+    )
+    _get_cache_marker_path(run_dir).write_text(marker.model_dump_json())
+
+
+# ---------------------------------------------------------------------------
+# Full dataset loader
+# ---------------------------------------------------------------------------
+
+def _apply_dtypes(df: pd.DataFrame, dtypes: dict[str, str]) -> pd.DataFrame:
+    """Apply scout-inferred dtype hints to DataFrame columns."""
+    for col, dtype in dtypes.items():
+        if col not in df.columns:
+            continue
+        if dtype in ("integer", "float", "numeric"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        elif dtype == "datetime":
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+        elif dtype == "boolean":
+            df[col] = (
+                df[col].astype(str).str.lower()
+                .map({"true": True, "false": False})
+                .astype("boolean")
+            )
+    return df
+
+
+def _load_full_dataframe(scout: ScoutResult, run_dir: Path) -> pd.DataFrame:
+    """
+    Load the COMPLETE dataset in priority order:
+
+    1. raw_data.csv in run_dir           — written by scout, always preferred
+    2. raw_data_path from scout JSON     — absolute path fallback
+    3. sample_data from scout JSON       — last resort, logs a warning
+
+    Never reads from scout.source (original upload path) because that file
+    may be a temp path that no longer exists after the upload completes.
+    """
+
+    # ── Priority 1: raw_data.csv in the shared run directory ─────────────
+    raw_csv = run_dir / "raw_data.csv"
+    if raw_csv.exists() and raw_csv.stat().st_size > 0:
+        df = pd.read_csv(raw_csv)
+        if not df.empty:
+            print(f"[labeler] Reading full dataset from raw_data.csv ({len(df):,} rows)", flush=True)
+            return _apply_dtypes(df, scout.dtypes)
+
+    # ── Priority 2: raw_data_path stored in scout JSON ────────────────────
+    if scout.raw_data_path:
+        p = Path(scout.raw_data_path)
+        if p.exists() and p.stat().st_size > 0:
+            df = pd.read_csv(p)
+            if not df.empty:
+                print(f"[labeler] Reading full dataset from raw_data_path ({len(df):,} rows)", flush=True)
+                # Copy into run_dir so downstream agents can find it
+                df.to_csv(raw_csv, index=False)
+                return _apply_dtypes(df, scout.dtypes)
+
+    # ── Priority 3: sample_data — last resort ────────────────────────────
+    if scout.sample_data:
+        print(
+            f"[labeler] WARNING: raw_data.csv not found. "
+            f"Falling back to sample_data ({len(scout.sample_data)} rows only). "
+            "The full dataset was not persisted by the Scout Agent. "
+            "Ensure run_dir is passed to scout() so raw_data.csv is written.",
+            flush=True,
+        )
+        df = pd.DataFrame(scout.sample_data)
+        return _apply_dtypes(df, scout.dtypes)
+
+    raise RuntimeError(
+        "No dataset available. Expected raw_data.csv in the run directory. "
+        "Make sure the Scout Agent receives run_dir so it can persist the full dataset."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -145,11 +297,6 @@ class ScoutResult(BaseModel):
 
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-
-
-def _safe_slug(text: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", text).strip("_")
-    return slug[:80] or "run"
 
 
 def _read_json(path: Path) -> Any:
@@ -165,261 +312,56 @@ def _write_json(path: Path, obj: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Ollama helpers
+# Filesystem helpers
 # ---------------------------------------------------------------------------
 
-def _ollama_alive(host: str) -> bool:
-    try:
-        import requests as req
-        return req.get(f"{host}/api/tags", timeout=2).status_code == 200
-    except Exception:
-        return False
+def _ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 
-def _generate_fallback_cleaning_code() -> str:
-    return """
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    df.columns = [
-        re.sub(r'[^a-z0-9]+', '_', str(c).strip().lower()).strip('_')
-        for c in df.columns
-    ]
-    df = df.dropna(how='all')
-    df = df.drop_duplicates()
-    for col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors='ignore')
-    return df
-
-def make_visual_report(df: pd.DataFrame, out_png_path: str) -> None:
-    sns.set_theme(style='whitegrid')
-    numeric_cols = df.select_dtypes(include='number').columns.tolist()
-    n = min(len(numeric_cols), 4)
-    if n == 0:
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.text(0.5, 0.5, 'No numeric columns to plot',
-                ha='center', va='center', fontsize=14)
-        ax.axis('off')
-    elif n == 1:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        sns.histplot(df[numeric_cols[0]].dropna(), bins=20, ax=ax, kde=True)
-        ax.set_title(f'Distribution of {numeric_cols[0]}')
-        ax.set_xlabel(numeric_cols[0])
-        ax.set_ylabel('Frequency')
-    else:
-        fig, axes = plt.subplots(1, n, figsize=(5 * n, 5))
-        for i, col in enumerate(numeric_cols[:n]):
-            sns.histplot(df[col].dropna(), bins=20, ax=axes[i], kde=True)
-            axes[i].set_title(f'Distribution of {col}')
-            axes[i].set_xlabel(col)
-            axes[i].set_ylabel('Frequency')
-    plt.tight_layout()
-    plt.savefig(out_png_path, dpi=300)
-    plt.close()
-"""
+def _read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _ollama_generate(model: str, prompt: str, host: str) -> str:
-    if not _ollama_alive(host):
-        return _generate_fallback_cleaning_code()
+def _write_text(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
 
-    try:
-        import ollama  # type: ignore
-        client = ollama.Client(host=host)
-        resp = client.generate(
-            model=model, prompt=prompt, stream=False,
-            options={"temperature": 0.1}, keep_alive=0,
-        )
-        text = str(resp.get("response", "")).strip()
-        # Strip markdown fences if present
-        if "```" in text:
-            m = re.search(r"```(?:python)?\n(.*?)```", text, re.DOTALL)
-            if m:
-                text = m.group(1).strip()
-        return text or _generate_fallback_cleaning_code()
-    except Exception:
-        try:
-            completed = subprocess.run(
-                ["ollama", "run", model],
-                input=prompt.encode(),
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=30, check=True,
-            )
-            text = completed.stdout.decode(errors="replace").strip()
-            return text or _generate_fallback_cleaning_code()
-        except Exception:
-            return _generate_fallback_cleaning_code()
-    finally:
-        subprocess.run(["ollama", "stop", model],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def _write_json(path: Path, obj: Any) -> None:
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
-# Code safety: AST validation
-# ---------------------------------------------------------------------------
-
-class UnsafeGeneratedCodeError(RuntimeError):
-    pass
-
-
-_DISALLOWED_AST_NODES: tuple[type[ast.AST], ...] = (
-    ast.Import, ast.ImportFrom, ast.With, ast.AsyncWith,
-    ast.Try, ast.Raise, ast.Lambda, ast.Global, ast.Nonlocal,
-)
-
-_DISALLOWED_CALL_NAMES = {
-    "open", "exec", "eval", "__import__", "compile", "input", "globals", "locals",
-}
-
-
-def _validate_generated_module(code: str) -> None:
-    tree = ast.parse(code)
-    for node in ast.walk(tree):
-        if isinstance(node, _DISALLOWED_AST_NODES):
-            raise UnsafeGeneratedCodeError(f"Disallowed syntax: {type(node).__name__}")
-        if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name) and node.func.id in _DISALLOWED_CALL_NAMES:
-                raise UnsafeGeneratedCodeError(f"Disallowed call: {node.func.id}")
-            if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
-                if node.func.value.id in {"os", "sys", "subprocess", "pathlib", "shutil"}:
-                    raise UnsafeGeneratedCodeError(
-                        f"Disallowed module usage: {node.func.value.id}"
-                    )
-    fn_names = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
-    missing = {"clean_dataframe", "make_visual_report"} - fn_names
-    if missing:
-        raise UnsafeGeneratedCodeError(
-            f"Missing required function(s): {', '.join(sorted(missing))}"
-        )
-
-
-def _strip_unsafe_lines(code: str) -> str:
-    """Remove import / try-except lines that would fail AST validation."""
-    lines = code.split("\n")
-    filtered, skip_indent = [], None
-
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(("import ", "from ")):
-            continue
-        if stripped.startswith("try"):
-            skip_indent = len(line) - len(line.lstrip())
-            continue
-        if skip_indent is not None:
-            cur = len(line) - len(line.lstrip()) if line.strip() else skip_indent + 1
-            if stripped.startswith(("except", "finally")):
-                continue
-            if line.strip() and cur <= skip_indent:
-                skip_indent = None          # exited the try block
-        if stripped == "pass" and skip_indent is not None:
-            continue
-        filtered.append(line)
-
-    return "\n".join(filtered)
-
-
-def _compile_generated_functions(
-    code: str,
-) -> tuple[Callable[[pd.DataFrame], pd.DataFrame], Callable[[pd.DataFrame, str], None]]:
-    code = _strip_unsafe_lines(code)
-    Path("debug_generated_code.py").write_text(code)
-    _validate_generated_module(code)
-
-    safe_builtins = {
-        "None": None, "True": True, "False": False,
-        "len": len, "min": min, "max": max, "sum": sum, "abs": abs,
-        "sorted": sorted, "range": range, "enumerate": enumerate,
-        "zip": zip, "map": map, "filter": filter, "any": any, "all": all,
-        "float": float, "int": int, "str": str,
-        "dict": dict, "list": list, "set": set, "tuple": tuple,
-        "isinstance": isinstance, "print": print,
-    }
-    globals_ns: dict[str, Any] = {
-        "__builtins__": safe_builtins,
-        "pd": pd, "np": np, "sns": sns, "plt": plt, "re": re,
-    }
-    locals_ns: dict[str, Any] = {}
-
-    exec(compile(code, "<llm_generated_phase2>", "exec"), globals_ns, locals_ns)
-
-    clean_fn = locals_ns.get("clean_dataframe")
-    viz_fn = locals_ns.get("make_visual_report")
-    if not callable(clean_fn) or not callable(viz_fn):
-        raise UnsafeGeneratedCodeError("Generated functions were not callable.")
-    return clean_fn, viz_fn
-
-
-# ---------------------------------------------------------------------------
-# Prompt builder — now dtype-aware thanks to ScoutResult
-# ---------------------------------------------------------------------------
-
-def _build_phase2_prompt(
-    df_preview_csv: str,
-    model_name: str,
-    dtypes: dict[str, str],
-    source_type: str,
-    num_rows: int,
-) -> str:
-    dtype_hint = (
-        "\nColumn dtype hints from Scout Agent:\n"
-        + "\n".join(f"  - {col}: {dtype}" for col, dtype in dtypes.items())
-        if dtypes else ""
-    )
-
-    return (
-        "You are a senior data engineer and scientific visualization specialist.\n"
-        "Generate Python code ONLY. No markdown. No explanations.\n"
-        "The code MUST define exactly two functions:\n\n"
-        "def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:\n"
-        "    ...\n\n"
-        "def make_visual_report(df: pd.DataFrame, out_png_path: str) -> None:\n"
-        "    ...\n\n"
-        "Cleaning requirements:\n"
-        "- Only drop rows that are completely empty: df.dropna(how='all').\n"
-        "- Standardize column names to snake_case (no spaces, no symbols).\n"
-        "- Use the dtype hints below to cast columns correctly.\n"
-        "- Return the cleaned DataFrame.\n"
-        f"{dtype_hint}\n\n"
-        "Visualization requirements:\n"
-        "- Use seaborn and matplotlib.\n"
-        "- Call sns.set_theme(style='whitegrid').\n"
-        f"- The data came from source_type='{source_type}' with ~{num_rows} rows.\n"
-        "- Choose the most informative plot(s) for the available columns and dtypes.\n"
-        "- Label all axes professionally with a descriptive title.\n"
-        "- Save high-DPI PNG to out_png_path (dpi>=300). Call plt.close().\n\n"
-        "Strict safety constraints:\n"
-        "- Do NOT import anything. pd, np, sns, plt, re are already available.\n"
-        "- Do NOT use try/except, with, raise, lambda, import.\n"
-        "- Do NOT access os, sys, subprocess, pathlib, open, exec, eval.\n\n"
-        f"Model: {model_name}\n"
-        "CSV preview of the DataFrame (first rows):\n"
-        f"{df_preview_csv}\n"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Main
+# Core runner — importable by graph.py / UI
 # ---------------------------------------------------------------------------
 
 def run_labeler(
     scout_json_path: Path,
-    model: str,
-    ollama_host: str,
+    model: str = None,
+    ollama_host: str = None,
     out_dir: str = "runs",
+    cleaning_profile: CleaningProfile = DEFAULT_CLEANING_PROFILE,
 ) -> dict[str, Any]:
     """
-    Core labeler logic — importable by Streamlit or other callers.
-    Returns the phase2_summary dict.
+    Main labeler pipeline. Reads the full dataset from raw_data.csv,
+    cleans it deterministically, generates a visual report, writes outputs.
+
+    Returns phase2_summary dict.
+
+    Note: model and ollama_host parameters are kept for API compatibility
+    but are no longer used (replaced with deterministic cleaning).
     """
     raw_obj = _read_json(scout_json_path)
 
-    # Accept both new ScoutResult and old Phase1Metadata shapes
+    # ── Parse scout output ────────────────────────────────────────────────
     try:
         scout = ScoutResult.model_validate(raw_obj)
     except ValidationError:
-        # Last-ditch: wrap old format into a minimal ScoutResult
+        # Back-compat: wrap old Phase1Metadata format
         scout = ScoutResult(
             is_dataset=True,
             source=raw_obj.get("source_url", "unknown"),
-            source_type="url",
+            source_type="csv",
             raw_quantitative_stats=raw_obj.get("raw_quantitative_stats"),
             primary_topic=raw_obj.get("primary_topic"),
             publication_date=raw_obj.get("publication_date"),
@@ -430,49 +372,61 @@ def run_labeler(
             f"Scout rejected the input as not a dataset: {scout.rejection_reason}"
         )
 
-    df = scout.to_dataframe()
-
-    if df.empty:
-        raise RuntimeError("Scout result produced an empty DataFrame — nothing to label.")
-
-    df_preview_csv = df.head(8).to_csv(index=False)
-
-    # Use scout's output dir (parent of JSON) or create new run dir
     run_dir = scout_json_path.parent
     _ensure_dir(run_dir)
 
-    _write_json(run_dir / "scout_input.json", raw_obj)
+    # ── Load FULL dataset ─────────────────────────────────────────────────
+    df = _load_full_dataframe(scout, run_dir)
+
+    if df.empty:
+        raise RuntimeError("Loaded DataFrame is empty — nothing to clean.")
+
+    # ── Write preview and input copy ──────────────────────────────────────
+    df_preview_csv = df.head(8).to_csv(index=False)
     _write_text(run_dir / "df_preview.csv", df_preview_csv)
+    _write_json(run_dir / "scout_input.json", raw_obj)
 
-    prompt = _build_phase2_prompt(
-        df_preview_csv=df_preview_csv,
-        model_name=model,
-        dtypes=scout.dtypes,
-        source_type=scout.source_type,
-        num_rows=scout.num_rows,
-    )
+    # ── Check cache: skip if identical dataset + profile ──────────────────
+    print(f"[labeler] Checking cache for duplicate cleaning...", flush=True)
+    if _should_skip_cleaning(df, cleaning_profile, run_dir):
+        print(f"[labeler] Dataset+profile already cleaned. Skipping.", flush=True)
+        # Load cached result
+        cleaned_csv_path = run_dir / "cleaned_data.csv"
+        if cleaned_csv_path.exists():
+            cleaned = pd.read_csv(cleaned_csv_path)
+            summary = {
+                "source": scout.effective_source(),
+                "source_type": scout.source_type,
+                "confidence_score": scout.confidence_score,
+                "cleaned_data_csv": str(cleaned_csv_path),
+                "visual_report_png": str(run_dir / "visual_report.png"),
+                "rows": int(cleaned.shape[0]),
+                "columns": list(map(str, cleaned.columns)),
+                "dtypes": {col: str(cleaned[col].dtype) for col in cleaned.columns},
+            }
+            return summary
 
-    code = _ollama_generate(model=model, prompt=prompt, host=ollama_host)
-    _write_text(run_dir / "llm_generated_phase2.py", code)
-
-    try:
-        clean_fn, viz_fn = _compile_generated_functions(code)
-    except (UnsafeGeneratedCodeError, SyntaxError) as e:
-        # Fall back to safe built-in functions
-        print(f"[labeler] Code validation failed ({e}), using fallback functions.")
-        clean_fn, viz_fn = _compile_generated_functions(_generate_fallback_cleaning_code())
-
-    cleaned = clean_fn(df.copy())
+    # ── Clean the FULL dataset (deterministic, no LLM) ────────────────────
+    print(f"[labeler] Cleaning: {len(df):,} rows × {len(df.columns)} columns", flush=True)
+    cleaned = _apply_deterministic_cleaning(df, cleaning_profile)
+    
     if not isinstance(cleaned, pd.DataFrame):
         raise RuntimeError("clean_dataframe() did not return a pandas DataFrame.")
 
+    print(f"[labeler] Cleaned: {len(cleaned):,} rows × {len(cleaned.columns)} columns", flush=True)
+
     cleaned_csv_path = run_dir / "cleaned_data.csv"
     cleaned.to_csv(cleaned_csv_path, index=False)
+    
+    # ── Mark cache as valid ──────────────────────────────────────────────
+    _save_cache_marker(df, cleaning_profile, run_dir)
 
+    # ── Visual report (fast builtin visualization) ────────────────────────
+    print(f"[labeler] Generating visual report...", flush=True)
     report_png_path = run_dir / "visual_report.png"
-    sns.set_theme(style="whitegrid")
-    viz_fn(cleaned, str(report_png_path))
+    _make_simple_visual_report(cleaned, str(report_png_path), cleaning_profile)
 
+    # ── Summary ───────────────────────────────────────────────────────────
     summary = {
         "source": scout.effective_source(),
         "source_type": scout.source_type,
@@ -487,26 +441,36 @@ def run_labeler(
     return summary
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main() -> int:
     env_file = Path(__file__).parent.parent / ".env"
     load_dotenv(dotenv_path=env_file)
 
     parser = argparse.ArgumentParser(
-        description="Labeler Agent (Phase 2): clean + visualise a ScoutResult JSON."
+        description="Labeler Agent (Phase 2): clean the full dataset from scout output."
     )
     parser.add_argument(
         "scout_json",
-        help="Path to scout_agent output JSON (scout_result.json or extracted_metadata.json)",
+        help="Path to scout_result.json written by the Scout Agent.",
     )
     parser.add_argument(
         "--model",
-        default=os.getenv("OLLAMA_PHASE2_MODEL", "qwen2.5-coder:3b"),
+        default=os.getenv("OLLAMA_PHASE2_MODEL", None),
+        help="(Deprecated - kept for backward compatibility)",
     )
     parser.add_argument(
         "--ollama-host",
-        default=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
+        default=os.getenv("OLLAMA_HOST", None),
+        help="(Deprecated - kept for backward compatibility)",
     )
-    parser.add_argument("--out-dir", default="runs")
+    parser.add_argument(
+        "--out-dir", 
+        default="runs",
+        help="Output directory (default: runs)"
+    )
     args = parser.parse_args()
 
     path = Path(args.scout_json)
@@ -518,6 +482,7 @@ def main() -> int:
         model=args.model,
         ollama_host=args.ollama_host,
         out_dir=args.out_dir,
+        cleaning_profile=DEFAULT_CLEANING_PROFILE,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
