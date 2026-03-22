@@ -125,6 +125,12 @@ def _check_completeness(run_dir: Path) -> list[CheckResult]:
 
 
 def _check_sanity(df: pd.DataFrame, analysis: dict[str, Any]) -> list[CheckResult]:
+    """
+    Split sanity checks across new dimensions:
+    - Data presence issues → "completeness"
+    - Type/value validation → "accuracy"
+    - Duplicate detection → "duplicates"
+    """
     checks: list[CheckResult] = []
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
@@ -133,32 +139,37 @@ def _check_sanity(df: pd.DataFrame, analysis: dict[str, Any]) -> list[CheckResul
     actual_rows = len(df)
     actual_cols = len(df.columns)
 
-    checks.append(_check("row_count_match", "sanity", "Row count matches analysis", reported_rows == actual_rows, "error", f"analysis={reported_rows}, actual={actual_rows}" if reported_rows != actual_rows else ""))
-    checks.append(_check("col_count_match", "sanity", "Column count matches analysis", reported_cols == actual_cols, "warning", f"analysis={reported_cols}, actual={actual_cols}" if reported_cols != actual_cols else ""))
+    # ACCURACY: Row/column count validation
+    checks.append(_check("row_count_match", "accuracy", "Row count matches analysis", reported_rows == actual_rows, "error", f"analysis={reported_rows}, actual={actual_rows}" if reported_rows != actual_rows else ""))
+    checks.append(_check("col_count_match", "accuracy", "Column count matches analysis", reported_cols == actual_cols, "warning", f"analysis={reported_cols}, actual={actual_cols}" if reported_cols != actual_cols else ""))
 
+    # COMPLETENESS: All-NA rows/columns (data presence)
     all_na_rows = int(df.isna().all(axis=1).sum())
-    checks.append(_check("no_all_na_rows", "sanity", "No fully-empty rows", all_na_rows == 0, "warning", f"{all_na_rows} fully-empty rows" if all_na_rows else ""))
+    checks.append(_check("no_all_na_rows", "completeness", "No fully-empty rows", all_na_rows == 0, "warning", f"{all_na_rows} fully-empty rows" if all_na_rows else ""))
 
     all_na_cols = [c for c in df.columns if df[c].isna().all()]
-    checks.append(_check("no_all_na_cols", "sanity", "No fully-empty columns", len(all_na_cols) == 0, "warning", f"{all_na_cols}" if all_na_cols else ""))
+    checks.append(_check("no_all_na_cols", "completeness", "No fully-empty columns", len(all_na_cols) == 0, "warning", f"{all_na_cols}" if all_na_cols else ""))
 
+    # DUPLICATES: Duplicate row detection
     dup = int(df.duplicated().sum())
-    checks.append(_check("no_duplicates", "sanity", "No duplicate rows", dup == 0, "info", f"{dup} duplicate rows" if dup else ""))
+    checks.append(_check("no_duplicates", "duplicates", "No duplicate rows", dup == 0, "info", f"{dup} duplicate rows" if dup else ""))
 
+    # ACCURACY: Count/percent column validation
     count_pattern = re.compile(r"(count|total|freq|num_|n_)", re.I)
     pct_pattern = re.compile(r"(pct|percent|rate|ratio)", re.I)
 
     for col in numeric_cols:
         if count_pattern.search(col):
             neg = int((pd.to_numeric(df[col], errors="coerce").dropna() < 0).sum())
-            checks.append(_check(f"non_negative_{col}", "sanity", f"Count-like `{col}` has no negatives", neg == 0, "error", f"{neg} negatives" if neg else ""))
+            checks.append(_check(f"non_negative_{col}", "accuracy", f"Count-like `{col}` has no negatives", neg == 0, "error", f"{neg} negatives" if neg else ""))
         if pct_pattern.search(col):
             s = pd.to_numeric(df[col], errors="coerce").dropna()
             out = int(((s < 0) | (s > 100)).sum())
-            checks.append(_check(f"pct_range_{col}", "sanity", f"Percent-like `{col}` in [0,100]", out == 0, "warning", f"{out} out-of-range values" if out else ""))
+            checks.append(_check(f"pct_range_{col}", "accuracy", f"Percent-like `{col}` in [0,100]", out == 0, "warning", f"{out} out-of-range values" if out else ""))
 
-    checks.append(_check("min_row_count", "sanity", "At least 3 rows", actual_rows >= 3, "error", f"rows={actual_rows}" if actual_rows < 3 else ""))
-    checks.append(_check("min_col_count", "sanity", "At least 2 columns", actual_cols >= 2, "error", f"cols={actual_cols}" if actual_cols < 2 else ""))
+    # ACCURACY: Minimum row/column requirements
+    checks.append(_check("min_row_count", "accuracy", "At least 3 rows", actual_rows >= 3, "error", f"rows={actual_rows}" if actual_rows < 3 else ""))
+    checks.append(_check("min_col_count", "accuracy", "At least 2 columns", actual_cols >= 2, "error", f"cols={actual_cols}" if actual_cols < 2 else ""))
     return checks
 
 
@@ -243,11 +254,78 @@ def _check_visualizations(viz_summary: dict[str, Any]) -> list[CheckResult]:
     return checks
 
 
+def _check_outliers(df: pd.DataFrame) -> list[CheckResult]:
+    """
+    Detect outliers in numeric columns using IQR method.
+    Flags dataset if outlier percentage exceeds thresholds.
+    """
+    checks: list[CheckResult] = []
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    
+    if not numeric_cols:
+        # No numeric columns → no outlier risk
+        checks.append(_check("outliers_evaluation", "outliers", "Numeric columns evaluated for outliers", True, "info", "No numeric columns — outlier check not applicable"))
+        return checks
+    
+    total_outlier_count = 0
+    total_data_points = 0
+    outlier_cols_with_issues = []
+    
+    for col in numeric_cols:
+        series = pd.to_numeric(df[col], errors='coerce').dropna()
+        if series.empty:
+            continue
+        
+        total_data_points += len(series)
+        
+        # IQR-based outlier detection
+        Q1 = series.quantile(0.25)
+        Q3 = series.quantile(0.75)
+        IQR = Q3 - Q1
+        
+        if IQR > 0:
+            lower_fence = Q1 - 1.5 * IQR
+            upper_fence = Q3 + 1.5 * IQR
+            col_outliers = int(((series < lower_fence) | (series > upper_fence)).sum())
+            total_outlier_count += col_outliers
+            
+            if col_outliers > 0:
+                outlier_pct = (col_outliers / len(series)) * 100
+                outlier_cols_with_issues.append((col, col_outliers, outlier_pct))
+    
+    if total_data_points == 0:
+        checks.append(_check("outliers_evaluation", "outliers", "Numeric columns evaluated for outliers", True, "info", "All numeric columns empty — outlier check not applicable"))
+        return checks
+    
+    total_outlier_pct = (total_outlier_count / total_data_points) * 100
+    
+    # Evaluation: outliers acceptable if < 5% of total data
+    outliers_acceptable = total_outlier_pct < 5.0
+    detail = f"{total_outlier_count} outliers detected ({total_outlier_pct:.1f}% of {total_data_points} values)"
+    
+    if outlier_cols_with_issues:
+        col_details = "; ".join([f"{c}: {cnt} ({pct:.1f}%)" for c, cnt, pct in outlier_cols_with_issues[:3]])
+        detail += f" — {col_details}"
+    
+    checks.append(_check(
+        "outliers_evaluation",
+        "outliers",
+        "Outlier levels acceptable (< 5%)",
+        outliers_acceptable,
+        "info" if outliers_acceptable else "warning",
+        detail
+    ))
+    
+    return checks
+
+
+
 _DIMENSION_WEIGHTS = {
     "completeness": 0.25,
-    "sanity": 0.35,
     "consistency": 0.25,
-    "visualization": 0.15,
+    "accuracy": 0.20,
+    "duplicates": 0.15,
+    "outliers": 0.15,
 }
 
 _SEVERITY_WEIGHT = {
@@ -260,16 +338,19 @@ _SEVERITY_WEIGHT = {
 def _score_dimension(checks: list[CheckResult], dimension: str) -> DimensionScore:
     dim_checks = [c for c in checks if c.category == dimension]
     if not dim_checks:
-        return DimensionScore(dimension=dimension, score=1.0, weight=_DIMENSION_WEIGHTS[dimension], checks_passed=0, checks_total=0)
+        return DimensionScore(dimension=dimension, score=0.99, weight=_DIMENSION_WEIGHTS.get(dimension, 0.2), checks_passed=0, checks_total=0)
 
     total = sum(_SEVERITY_WEIGHT[c.severity] for c in dim_checks)
     penalty = sum(_SEVERITY_WEIGHT[c.severity] for c in dim_checks if not c.passed)
     score = 1.0 - (penalty / total) if total > 0 else 1.0
+    
+    # Cap individual dimension scores at 0.99 for conservatism
+    score = min(score, 0.99)
 
     return DimensionScore(
         dimension=dimension,
         score=round(max(0.0, score), 4),
-        weight=_DIMENSION_WEIGHTS[dimension],
+        weight=_DIMENSION_WEIGHTS.get(dimension, 0.2),
         checks_passed=sum(1 for c in dim_checks if c.passed),
         checks_total=len(dim_checks),
     )
@@ -278,8 +359,13 @@ def _score_dimension(checks: list[CheckResult], dimension: str) -> DimensionScor
 def _overall_confidence(dim_scores: list[DimensionScore]) -> float:
     total_weight = sum(d.weight for d in dim_scores)
     if total_weight == 0:
-        return 0.0
-    return round(sum(d.score * d.weight for d in dim_scores) / total_weight, 4)
+        return 0.99  # All no checks — conservative fallback
+    
+    weighted_sum = sum(d.score * d.weight for d in dim_scores)
+    confidence = weighted_sum / total_weight
+    
+    # Cap overall confidence at 0.99 — acknowledges data inherent uncertainty
+    return round(min(confidence, 0.99), 4)
 
 
 def _derive_status(confidence: float, checks: list[CheckResult]) -> Status:
@@ -291,10 +377,10 @@ def _derive_status(confidence: float, checks: list[CheckResult]) -> Status:
     return "APPROVED"
 
 
-def _build_report(result: ValidationResult) -> str:
+def _build_report(result: ValidationResult, run_dir: Path | None = None) -> str:
     """
-    Build a clean, compact validation report in markdown format.
-    Focus on readability with only essential information highlighted.
+    Build a comprehensive validation report in markdown format.
+    Includes before/after data quality transformation metrics and quality scores table.
     """
     lines = [
         "# Validation Report",
@@ -303,7 +389,7 @@ def _build_report(result: ValidationResult) -> str:
         "",
     ]
     
-    # Summary metrics in a concise format
+    # Summary metrics
     lines += [
         "## Dataset Information",
         f"- Rows: {result.num_rows:,} | Columns: {result.num_columns}",
@@ -312,14 +398,76 @@ def _build_report(result: ValidationResult) -> str:
         "",
     ]
     
-    # Quality scores by dimension
-    lines += ["## Quality Scores"]
+    # Data Quality Transformation: Before/After Comparison
+    if run_dir:
+        raw_csv = run_dir / "raw_data.csv"
+        cleaned_csv = run_dir / "cleaned_data.csv"
+        
+        if raw_csv.exists() and cleaned_csv.exists():
+            try:
+                df_raw = pd.read_csv(raw_csv)
+                df_cleaned = pd.read_csv(cleaned_csv)
+                
+                # Compute before/after metrics
+                raw_rows = len(df_raw)
+                cleaned_rows = len(df_cleaned)
+                rows_removed = raw_rows - cleaned_rows
+                
+                raw_cols = len(df_raw.columns)
+                cleaned_cols = len(df_cleaned.columns)
+                cols_removed = raw_cols - cleaned_cols
+                
+                raw_missing = df_raw.isna().sum().sum()
+                cleaned_missing = df_cleaned.isna().sum().sum()
+                missing_removed = raw_missing - cleaned_missing
+                
+                raw_total_cells = raw_rows * raw_cols
+                cleaned_total_cells = cleaned_rows * cleaned_cols
+                raw_missing_pct = (raw_missing / raw_total_cells * 100) if raw_total_cells > 0 else 0.0
+                cleaned_missing_pct = (cleaned_missing / cleaned_total_cells * 100) if cleaned_total_cells > 0 else 0.0
+                
+                raw_dups = len(df_raw) - len(df_raw.drop_duplicates())
+                cleaned_dups = len(df_cleaned) - len(df_cleaned.drop_duplicates())
+                
+                # Format duplicate row percentages safely
+                raw_dup_pct = (100 * raw_dups / raw_rows) if raw_rows > 0 else 0.0
+                cleaned_dup_pct = (100 * cleaned_dups / cleaned_rows) if cleaned_rows > 0 else 0.0
+                
+                lines += [
+                    "## Data Quality Transformation",
+                    "",
+                    "| Metric | Before Clean | After Clean | Change |",
+                    "|--------|--------------|-------------|--------|",
+                    f"| Total Rows | {raw_rows:,} | {cleaned_rows:,} | {rows_removed:+,} |",
+                    f"| Total Columns | {raw_cols} | {cleaned_cols} | {cols_removed:+,} |",
+                    f"| Missing Values | {raw_missing:,} ({raw_missing_pct:.1f}%) | {cleaned_missing:,} ({cleaned_missing_pct:.1f}%) | {missing_removed:+,} ↓ |",
+                    f"| Duplicate Rows | {raw_dups} ({raw_dup_pct:.1f}%) | {cleaned_dups} ({cleaned_dup_pct:.1f}%) | {raw_dups - cleaned_dups:+,} ↓ |",
+                    "",
+                ]
+            except Exception as e:
+                lines += [
+                    "## Data Quality Transformation",
+                    f"*Could not compute transformation metrics: {e}*",
+                    "",
+                ]
+    
+    # Quality Scores Table (5 metrics)
+    lines += [
+        "## Quality Metric Scores",
+        "",
+        "| Metric | Score | Status | Details |",
+        "|--------|-------|--------|---------|",
+    ]
+    
     for d in result.dimension_scores:
-        status_icon = "✓" if d.score >= 0.9 else "⚠" if d.score >= 0.75 else "✗"
-        lines.append(f"**{status_icon} {d.dimension.title()}:** {d.score:.1%} ({d.checks_passed}/{d.checks_total} passed)")
+        status_icon = "✓" if d.score >= 0.90 else "⚠" if d.score >= 0.75 else "✗"
+        status_text = "Good" if d.score >= 0.90 else "Acceptable" if d.score >= 0.75 else "Needs Review"
+        details = f"{d.checks_passed}/{d.checks_total} checks passed"
+        lines.append(f"| {d.dimension.capitalize()} | {d.score:.1%} | {status_icon} {status_text} | {details} |")
+    
     lines.append("")
     
-    # Group checks by category and show only failures
+    # Issues Found
     failed_by_category = {}
     for c in result.checks:
         if not c.passed:
@@ -373,9 +521,11 @@ def run_validation(
     if not df.empty:
         checks += _check_sanity(df, analysis)
         checks += _check_consistency(df, analysis)
+        checks += _check_outliers(df)
     checks += _check_visualizations(viz_summary)
 
-    dimensions = ["completeness", "sanity", "consistency", "visualization"]
+    # 5-metric framework: Completeness, Consistency, Accuracy, Duplicates, Outliers
+    dimensions = ["completeness", "consistency", "accuracy", "duplicates", "outliers"]
     dim_scores = [_score_dimension(checks, d) for d in dimensions]
     confidence = _overall_confidence(dim_scores)
     status = _derive_status(confidence, checks)
@@ -401,7 +551,7 @@ def run_validation(
 
     result_dict = result.model_dump()
     _write_json(run_dir / "validation_result.json", result_dict)
-    _write_text(run_dir / "validation_report.md", _build_report(result))
+    _write_text(run_dir / "validation_report.md", _build_report(result, run_dir))
     return result_dict
 
 

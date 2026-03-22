@@ -1,67 +1,53 @@
-import { Search, ArrowRight, Loader, RotateCw, AlertCircle, ChevronDown, ChevronUp, Plus, X } from "lucide-react";
+import { ArrowRight, Loader, RotateCw, AlertCircle, ChevronDown, ChevronUp, Plus, X } from "lucide-react";
 import { useState, useRef } from "react";
 import { usePipeline } from "@/context/PipelineContext";
 import { useToast } from "@/hooks/use-toast";
 
 const InputZone = () => {
-  const { url, isRunning, isLoading, run, startPollingWithRunId, errorMessage, retry, status, debugLogs } = usePipeline();
-  const [inputValue, setInputValue] = useState(url || "");
+  const { isRunning, isLoading, startPollingWithRunId, errorMessage, retry, status, debugLogs } = usePipeline();
   const [showDebugLogs, setShowDebugLogs] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
 
   const handleSubmit = async () => {
-    const source = selectedFile || inputValue.trim();
-    
-    if (!source) {
+    if (!selectedFile) {
       toast({
         title: "Error",
-        description: "Please enter a source (URL, file path, or upload a file)",
+        description: "Please upload a file to begin",
         variant: "destructive",
       });
       return;
     }
 
     try {
-      // If file is selected, send as FormData
-      if (selectedFile) {
-        const formData = new FormData();
-        formData.append("file", selectedFile);
-        
-        const response = await fetch(`${import.meta.env.VITE_API_BASE_URL || "http://localhost:8000"}/run`, {
-          method: "POST",
-          body: formData,
-        });
-        
-        if (!response.ok) {
-          const errorData = await response.json();
-          throw new Error(errorData.error || "Failed to start pipeline with file");
-        }
-        
-        const data = await response.json();
-        const runId = data.run_id;
-        
-        if (!runId) {
-          throw new Error("No run_id received from server");
-        }
-        
-        // Start polling immediately with the run_id
-        startPollingWithRunId(runId, selectedFile.name);
-        
-        toast({
-          title: "Pipeline started",
-          description: `Processing ${selectedFile.name}...`,
-        });
-      } else {
-        // For URL/path input, use the normal run() function
-        await run(inputValue.trim());
-        
-        toast({
-          title: "Pipeline started",
-          description: `Acquiring data from ${inputValue.trim()}`,
-        });
+      const formData = new FormData();
+      formData.append("file", selectedFile);
+      
+      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL || "http://localhost:8000"}/run`, {
+        method: "POST",
+        body: formData,
+      });
+      
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || "Failed to start pipeline with file");
       }
+      
+      const data = await response.json();
+      const runId = data.run_id;
+      
+      if (!runId) {
+        throw new Error("No run_id received from server");
+      }
+      
+      // Start polling immediately with the run_id
+      startPollingWithRunId(runId, selectedFile.name);
+      
+      toast({
+        title: "Pipeline started",
+        description: `Processing ${selectedFile.name}...`,
+      });
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Failed to start pipeline";
@@ -89,7 +75,6 @@ const InputZone = () => {
       }
       
       setSelectedFile(file);
-      setInputValue(""); // Clear text input when file is selected
       toast({
         title: "File selected",
         description: `Ready to process ${file.name}`,
@@ -104,11 +89,7 @@ const InputZone = () => {
     }
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !isRunning && !isLoading) {
-      handleSubmit();
-    }
-  };
+
 
   return (
     <div className="px-6 pb-4 space-y-3">
@@ -155,64 +136,51 @@ const InputZone = () => {
         )}
       </div>
 
-      {/* Text Input Section */}
-      <div className="space-y-2">
-        <p className="text-xs font-medium text-muted-foreground">Or paste URL / file path:</p>
-        <div className="relative flex items-center">
-          <Search className="absolute left-4 h-4 w-4 text-muted-foreground" />
-          <input
-            type="text"
-            value={inputValue}
-            onChange={(e) => setInputValue(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Paste a URL, local file path, or raw text to begin…"
-            disabled={isRunning || isLoading || selectedFile !== null}
-            className="h-11 w-full rounded-md border bg-card pl-11 pr-28 font-body text-sm text-foreground placeholder:text-muted-foreground focus:border-success focus:outline-none focus:ring-1 focus:ring-success transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
-          />
-          {status === "error" ? (
-            <button
-              onClick={async () => {
-                await retry();
-                toast({
-                  title: "Retrying",
-                  description: "Attempting to resume pipeline...",
-                });
-              }}
-              disabled={isLoading}
-              className="absolute right-1.5 flex h-8 items-center gap-1.5 rounded-md bg-orange-600 px-4 font-display text-xs font-medium text-white transition-colors duration-150 hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {isLoading ? (
-                <>
-                  <Loader className="h-3.5 w-3.5 animate-spin" />
-                  Retrying
-                </>
-              ) : (
-                <>
-                  <RotateCw className="h-3.5 w-3.5" />
-                  Retry
-                </>
-              )}
-            </button>
-          ) : (
-            <button
-              onClick={handleSubmit}
-              disabled={isRunning || isLoading || (!inputValue.trim() && !selectedFile)}
-              className="absolute right-1.5 flex h-8 items-center gap-1.5 rounded-md bg-primary px-4 font-display text-xs font-medium text-primary-foreground transition-colors duration-150 hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {isLoading ? (
-                <>
-                  <Loader className="h-3.5 w-3.5 animate-spin" />
-                  Starting
-                </>
-              ) : (
-                <>
-                  Run
-                  <ArrowRight className="h-3.5 w-3.5" />
-                </>
-              )}
-            </button>
-          )}
-        </div>
+      {/* Run Button */}
+      <div className="flex gap-2">
+        {status === "error" ? (
+          <button
+            onClick={async () => {
+              await retry();
+              toast({
+                title: "Retrying",
+                description: "Attempting to resume pipeline...",
+              });
+            }}
+            disabled={isLoading}
+            className="flex-1 flex items-center justify-center gap-1.5 rounded-md bg-orange-600 px-4 py-2.5 font-display text-sm font-medium text-white transition-colors duration-150 hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isLoading ? (
+              <>
+                <Loader className="h-4 w-4 animate-spin" />
+                Retrying
+              </>
+            ) : (
+              <>
+                <RotateCw className="h-4 w-4" />
+                Retry
+              </>
+            )}
+          </button>
+        ) : (
+          <button
+            onClick={handleSubmit}
+            disabled={isRunning || isLoading || !selectedFile}
+            className="flex-1 flex items-center justify-center gap-1.5 rounded-md bg-primary px-4 py-2.5 font-display text-sm font-medium text-primary-foreground transition-colors duration-150 hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isLoading ? (
+              <>
+                <Loader className="h-4 w-4 animate-spin" />
+                Starting
+              </>
+            ) : (
+              <>
+                Run
+                <ArrowRight className="h-4 w-4" />
+              </>
+            )}
+          </button>
+        )}
       </div>
       {errorMessage && (
         <div className="mt-2 space-y-2">

@@ -1,6 +1,7 @@
 import { BadgeCheck, Copy, Download, Loader } from "lucide-react";
 import { usePipeline } from "@/context/PipelineContext";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { useToast } from "@/hooks/use-toast";
 
 const ReportPanel = () => {
@@ -96,6 +97,7 @@ const ReportPanel = () => {
         ) : (
           <div className="rounded-md border bg-card p-6 shadow-sm prose prose-sm dark:prose-invert max-w-none overflow-x-auto">
             <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
               components={{
                 h1: ({ node, ...props }) => (
                   <h1 className="font-display text-lg font-bold text-foreground mb-4 break-words" {...props} />

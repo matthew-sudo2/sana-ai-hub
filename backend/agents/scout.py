@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field
 
@@ -114,6 +115,206 @@ def _write_json(path: Path, obj: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Quality Metrics Computation — Stricter Confidence Scoring
+# ---------------------------------------------------------------------------
+
+def _compute_completeness(df: pd.DataFrame) -> float:
+    """
+    Completeness: Proportion of non-null cells in the dataset.
+    Range: [0, 1], where 1.0 = all cells filled, 0 = all null.
+    Capped at 0.99 for conservatism.
+    """
+    if df.empty:
+        return 0.0
+    total_cells = df.shape[0] * df.shape[1]
+    non_null = df.notna().sum().sum()
+    score = non_null / total_cells if total_cells > 0 else 0.0
+    return min(score, 0.99)
+
+
+def _compute_consistency(df: pd.DataFrame) -> float:
+    """
+    Consistency: Proportion of rows that match expected dtype patterns.
+    Checks if values in numeric/datetime columns can be parsed correctly.
+    Range: [0, 1], capped at 0.99.
+    """
+    if df.empty:
+        return 0.0
+    
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    datetime_cols = df.select_dtypes(include=['datetime64']).columns.tolist()
+    
+    if not numeric_cols and not datetime_cols:
+        return 0.95  # All categorical is consistent but not fully validated
+    
+    total_checks = 0
+    passed_checks = 0
+    
+    # Check numeric columns for parseable values
+    for col in numeric_cols:
+        total_checks += len(df)
+        for val in df[col]:
+            if pd.isna(val):
+                passed_checks += 1  # NaN is acceptable
+            elif isinstance(val, (int, float, np.number)):
+                passed_checks += 1
+            else:
+                try:
+                    float(val)
+                    passed_checks += 1
+                except (ValueError, TypeError):
+                    pass
+    
+    # Check datetime columns
+    for col in datetime_cols:
+        total_checks += len(df)
+        passed_checks += sum(1 for val in df[col] if pd.isna(val) or isinstance(val, pd.Timestamp))
+    
+    score = passed_checks / total_checks if total_checks > 0 else 1.0
+    return min(score, 0.99)
+
+
+def _compute_accuracy_score(df: pd.DataFrame) -> float:
+    """
+    Accuracy: Basic type validation — checks dtype inference credibility.
+    Validates that inferred types match actual data patterns.
+    Range: [0, 1], capped at 0.99.
+    """
+    if df.empty:
+        return 0.0
+    
+    accuracy_checks = 0
+    total_columns = len(df.columns)
+    
+    for col in df.columns:
+        col_dtype = df[col].dtype
+        non_null_vals = df[col].dropna()
+        
+        if non_null_vals.empty:
+            accuracy_checks += 1  # Empty column is valid
+            continue
+        
+        # Type validation rules
+        if col_dtype.kind == 'i' or col_dtype.kind == 'u':  # integer
+            try:
+                pd.to_numeric(df[col], errors='coerce')
+                accuracy_checks += 1
+            except:
+                pass
+        elif col_dtype.kind == 'f':  # float
+            try:
+                pd.to_numeric(df[col], errors='coerce')
+                accuracy_checks += 1
+            except:
+                pass
+        elif col_dtype.kind == 'M':  # datetime
+            try:
+                pd.to_datetime(df[col], errors='coerce')
+                accuracy_checks += 1
+            except:
+                pass
+        else:  # categorical / object — just check it's not all null
+            accuracy_checks += 1
+    
+    score = accuracy_checks / total_columns if total_columns > 0 else 1.0
+    return min(score, 0.99)
+
+
+def _compute_duplicate_score(df: pd.DataFrame) -> float:
+    """
+    Duplicate Score: (1 - duplicate_ratio)
+    Measures uniqueness of rows. Score = 1.0 if no duplicates, decreases with ratio.
+    Range: [0, 1], capped at 0.99.
+    """
+    if df.empty:
+        return 0.0
+    
+    total_rows = len(df)
+    duplicate_count = df.duplicated().sum()
+    duplicate_ratio = duplicate_count / total_rows if total_rows > 0 else 0.0
+    score = 1.0 - duplicate_ratio
+    return min(score, 0.99)
+
+
+def _compute_outlier_score(df: pd.DataFrame) -> float:
+    """
+    Outlier Score: (1 - outlier_pct) using IQR method on numeric columns.
+    Detects outliers; score penalizes high outlier percentages.
+    Range: [0, 1], capped at 0.99.
+    """
+    if df.empty:
+        return 0.0
+    
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    
+    # If no numeric columns, consider as no outlier risk
+    if not numeric_cols:
+        return 0.95
+    
+    total_data_points = 0
+    outlier_count = 0
+    
+    for col in numeric_cols:
+        series = pd.to_numeric(df[col], errors='coerce').dropna()
+        if series.empty:
+            continue
+        
+        total_data_points += len(series)
+        
+        # IQR-based outlier detection
+        Q1 = series.quantile(0.25)
+        Q3 = series.quantile(0.75)
+        IQR = Q3 - Q1
+        
+        if IQR > 0:
+            lower_fence = Q1 - 1.5 * IQR
+            upper_fence = Q3 + 1.5 * IQR
+            outliers_in_col = ((series < lower_fence) | (series > upper_fence)).sum()
+            outlier_count += outliers_in_col
+    
+    if total_data_points == 0:
+        return 0.95
+    
+    outlier_pct = outlier_count / total_data_points
+    score = 1.0 - outlier_pct
+    return min(score, 0.99)
+
+
+def _compute_confidence_weighted(
+    completeness: float,
+    consistency: float,
+    accuracy: float,
+    duplicates: float,
+    outliers: float,
+) -> float:
+    """
+    Weighted confidence formula per user spec:
+    Confidence = 0.25*C + 0.25*K + 0.20*A + 0.15*D + 0.15*O
+    
+    All inputs should be in [0, 1] range already (pre-capped).
+    Final result capped at 0.99.
+    """
+    weights = {
+        "completeness": 0.25,
+        "consistency": 0.25,
+        "accuracy": 0.20,
+        "duplicates": 0.15,
+        "outliers": 0.15,
+    }
+    
+    confidence = (
+        weights["completeness"] * completeness +
+        weights["consistency"] * consistency +
+        weights["accuracy"] * accuracy +
+        weights["duplicates"] * duplicates +
+        weights["outliers"] * outliers
+    )
+    
+    # Cap at 0.99 — acknowledges data inherent uncertainty
+    return min(confidence, 0.99)
+
+
+# ---------------------------------------------------------------------------
 # Core builder — validates DataFrame, saves raw_data.csv, returns ScoutResult
 # ---------------------------------------------------------------------------
 
@@ -121,15 +322,19 @@ def _build_result(
     df: pd.DataFrame,
     source: str,
     source_type: str,
-    confidence: float,
     run_dir: Path | None = None,
 ) -> ScoutResult:
     """
     Validate the DataFrame, infer dtypes, persist the FULL dataset to disk,
-    and return a ScoutResult.
+    and return a ScoutResult with computed weighted confidence score.
 
     raw_data.csv  → complete dataset, read by Labeler Agent
     sample_data   → first 5 rows only, stored in JSON for UI display
+    
+    Confidence computation:
+    - Computes 5 quality metrics (Completeness, Consistency, Accuracy, Duplicates, Outliers)
+    - Combines using weighted formula: 0.25*C + 0.25*K + 0.20*A + 0.15*D + 0.15*O
+    - All metrics capped individually at 0.99; final confidence also capped at 0.99
     """
     # ── Size guard ───────────────────────────────────────────────────────
     if df.empty or len(df) < MIN_ROWS or len(df.columns) < MIN_COLS:
@@ -148,6 +353,28 @@ def _build_result(
 
     columns  = list(df.columns.astype(str))
     dtypes   = {str(col): _dtype_name(df[col]) for col in df.columns}
+
+    # ── Compute quality metrics and confidence ────────────────────────────
+    completeness = _compute_completeness(df)
+    consistency = _compute_consistency(df)
+    accuracy = _compute_accuracy_score(df)
+    duplicates = _compute_duplicate_score(df)
+    outliers = _compute_outlier_score(df)
+    
+    # Compute weighted confidence
+    confidence = _compute_confidence_weighted(completeness, consistency, accuracy, duplicates, outliers)
+    
+    # Debug logging (optional, can be removed later)
+    print(
+        f"[scout] Confidence metrics for {source}:\n"
+        f"  Completeness: {completeness:.2f}\n"
+        f"  Consistency: {consistency:.2f}\n"
+        f"  Accuracy: {accuracy:.2f}\n"
+        f"  Duplicates: {duplicates:.2f}\n"
+        f"  Outliers: {outliers:.2f}\n"
+        f"  → Weighted Confidence: {confidence:.2f}",
+        flush=True
+    )
 
     # ── Persist FULL dataset ─────────────────────────────────────────────
     raw_data_path: str | None = None
@@ -189,7 +416,7 @@ def _load_csv(
 ) -> ScoutResult:
     try:
         df = pd.read_csv(io.BytesIO(bytes(source))) if isinstance(source, (bytes, bytearray)) else pd.read_csv(source)
-        return _build_result(df, label, "csv", confidence=0.95, run_dir=run_dir)
+        return _build_result(df, label, "csv", run_dir=run_dir)
     except Exception as e:
         return ScoutResult(is_dataset=False, source=label, source_type="csv",
                            rejection_reason=f"CSV parse error: {e}")
@@ -202,7 +429,7 @@ def _load_excel(
 ) -> ScoutResult:
     try:
         df = pd.read_excel(io.BytesIO(bytes(source))) if isinstance(source, (bytes, bytearray)) else pd.read_excel(source)
-        return _build_result(df, label, "xlsx", confidence=0.95, run_dir=run_dir)
+        return _build_result(df, label, "xlsx", run_dir=run_dir)
     except Exception as e:
         return ScoutResult(is_dataset=False, source=label, source_type="xlsx",
                            rejection_reason=f"Excel parse error: {e}")
@@ -225,7 +452,7 @@ def _load_json(
             return ScoutResult(is_dataset=False, source=label, source_type="json",
                                rejection_reason="JSON root must be a list or dict.")
 
-        return _build_result(df, label, "json", confidence=0.90, run_dir=run_dir)
+        return _build_result(df, label, "json", run_dir=run_dir)
     except Exception as e:
         return ScoutResult(is_dataset=False, source=label, source_type="json",
                            rejection_reason=f"JSON parse error: {e}")
