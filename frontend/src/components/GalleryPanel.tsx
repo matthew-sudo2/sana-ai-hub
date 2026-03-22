@@ -109,7 +109,7 @@ const GalleryPanel = () => {
             {displayImages.map((filename) => (
               <div
                 key={filename}
-                className="group rounded-lg border bg-card overflow-hidden cursor-pointer transition-all duration-300 hover:border-primary/50 hover:shadow-lg"
+                className="group rounded-lg border bg-card overflow-hidden cursor-pointer transition-all duration-500 hover:border-primary/50 hover:scale-105"
               >
                 {/* Image Preview - Full Size */}
                 <div className="relative h-48 bg-muted/30 overflow-hidden">
@@ -118,7 +118,7 @@ const GalleryPanel = () => {
                       <img
                         src={getImageURL(runId, filename)}
                         alt={filename}
-                        className="h-full w-full object-cover"
+                        className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-110"
                       />
                       {/* Enhanced Hover Overlay with Actions */}
                       <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-black/20 to-transparent opacity-0 group-hover:opacity-100 transition-all duration-300 flex items-end justify-center pb-4 gap-3">

@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Literal
 
@@ -93,6 +94,9 @@ def _apply_deterministic_cleaning(
     Fast, reproducible data cleaning without LLM. Runs in <1 second.
     Returns (cleaned_df, metrics_dict) to track what was removed/cleaned.
     """
+    print(f"[labeler] _apply_deterministic_cleaning START: {len(df)} rows x {len(df.columns)} columns", flush=True)
+    print(f"[labeler]   Column names: {list(df.columns)}", flush=True)
+    
     metrics = {
         "rows_input": len(df),
         "columns_input": len(df.columns),
@@ -118,13 +122,23 @@ def _apply_deterministic_cleaning(
     if profile.drop_empty_rows:
         rows_before = len(df)
         df = df.dropna(how='all')
-        metrics["empty_rows_removed"] = rows_before - len(df)
+        removed = rows_before - len(df)
+        metrics["empty_rows_removed"] = removed
+        print(f"[labeler]   After drop_empty_rows: {len(df)} rows (removed {removed}), {len(df.columns)} columns", flush=True)
 
     # Drop fully empty columns
     if profile.drop_empty_cols:
         cols_before = len(df.columns)
+        cols_before_names = list(df.columns)
         df = df.dropna(axis=1, how='all')
-        metrics["empty_columns_removed"] = cols_before - len(df.columns)
+        cols_removed = cols_before - len(df.columns)
+        cols_after_names = list(df.columns)
+        metrics["empty_columns_removed"] = cols_removed
+        print(f"[labeler]   After drop_empty_cols: {len(df)} rows, {len(df.columns)} columns (removed {cols_removed})", flush=True)
+        if cols_removed > 0:
+            removed_cols = set(cols_before_names) - set(cols_after_names)
+            print(f"[labeler]     Removed columns: {removed_cols}", flush=True)
+
 
     # Remove duplicate rows
     if profile.drop_duplicates:
@@ -133,12 +147,18 @@ def _apply_deterministic_cleaning(
         metrics["duplicates_removed"] = rows_before - len(df)
 
     # Auto-detect and convert numeric-looking columns (handles "age" stored as string)
+    numeric_name_hints = {'age', 'salary', 'price', 'cost', 'amount', 'revenue', 'score', 'rating', 'years', 'experience', 'count', 'total', 'quantity', 'id', 'year', 'month', 'day'}
     for col in df.columns:
         if df[col].dtype == 'object':  # String/mixed type column
             # Try to convert to numeric, coerce blanks to NaN
             converted = pd.to_numeric(df[col], errors='coerce')
-            # Only replace if most values converted successfully (>50%)
-            if converted.notna().sum() / len(df) > 0.5:  # If 50%+ converted
+            col_name_lower = col.lower()
+            conversion_ratio = converted.notna().sum() / len(df)
+            
+            # Convert if: (1) 20%+ values converted OR (2) column name hints it's numeric
+            is_numeric_by_name = any(hint in col_name_lower for hint in numeric_name_hints)
+            if conversion_ratio > 0.2 or (is_numeric_by_name and converted.notna().sum() > 0):
+                print(f"[labeler] Converting '{col}' to numeric ({conversion_ratio*100:.1f}% non-null, numeric_name={is_numeric_by_name})", flush=True)
                 df[col] = converted
 
     # Handle missing values
@@ -151,7 +171,7 @@ def _apply_deterministic_cleaning(
         numeric_cols = df.select_dtypes(include=[np.number]).columns
         missing_before = df.isna().sum().sum()
         for col in numeric_cols:
-            df[col].fillna(df[col].mean(), inplace=True)
+            df[col] = df[col].fillna(df[col].mean())
         missing_after = df.isna().sum().sum()
         metrics["missing_values_filled"] = missing_before - missing_after
     elif profile.fill_missing_strategy == "median":
@@ -168,9 +188,11 @@ def _apply_deterministic_cleaning(
             print(f"[labeler]   Column '{col}': dtype={df[col].dtype}, non-null={col_non_null}, missing={col_missing}, median={col_median}", flush=True)
             
             if col_missing > 0:
-                df[col].fillna(col_median, inplace=True)
+                print(f"[labeler]     BEFORE fill: {df[col].isna().sum()} missing in df[{col}]", flush=True)
+                df[col] = df[col].fillna(col_median)
                 after_fill = df[col].isna().sum()
-                print(f"[labeler]     After fill: remaining missing={after_fill}", flush=True)
+                print(f"[labeler]     AFTER fill: remaining missing={after_fill} in df[{col}]", flush=True)
+                print(f"[labeler]     Verify: current df[{col}] has {df[col].notna().sum()} non-null values", flush=True)
         
         missing_after = df.isna().sum().sum()
         metrics["missing_values_filled"] = missing_before - missing_after
@@ -192,6 +214,23 @@ def _apply_deterministic_cleaning(
     # Final metrics
     metrics["rows_output"] = len(df)
     metrics["columns_output"] = len(df.columns)
+    
+    print(f"[labeler] _apply_deterministic_cleaning END: {len(df)} rows x {len(df.columns)} columns", flush=True)
+    print(f"[labeler]   Final columns: {list(df.columns)}", flush=True)
+    
+    # DEBUG: Check final state before returning
+    if 'age' in df.columns:
+        age_missing_final = df['age'].isna().sum()
+        age_non_null_final = df['age'].notna().sum()
+        print(f"[labeler] _apply_deterministic_cleaning FINAL CHECK: age has {age_non_null_final} non-null, {age_missing_final} missing", flush=True)
+        print(f"[labeler] DEBUG: age sample before return: {df['age'].head(5).tolist()}", flush=True)
+        print(f"[labeler] DEBUG: age dtype at return: {df['age'].dtype}", flush=True)
+        # VERIFY: No NaN should exist after median fill
+        if age_missing_final > 0:
+            print(f"[labeler] ⚠️ WARNING: {age_missing_final} NaN values still exist in age after median fill!", flush=True)
+            print(f"[labeler] Age NaN indices: {df[df['age'].isna()].index.tolist()[:10]}", flush=True)
+    else:
+        print(f"[labeler] WARNING: 'age' column not found! Columns are: {list(df.columns)}", flush=True)
 
     return df, metrics
 
@@ -295,14 +334,31 @@ def _save_cache_marker(
 # ---------------------------------------------------------------------------
 
 def _apply_dtypes(df: pd.DataFrame, dtypes: dict[str, str]) -> pd.DataFrame:
-    """Apply scout-inferred dtype hints to DataFrame columns."""
+    """Apply scout-inferred dtype hints to DataFrame columns.
+    
+    IMPORTANT: Only apply conversions if they would actually preserve data.
+    Skip conversions that would result in all-NaN columns (data destruction).
+    """
     for col, dtype in dtypes.items():
         if col not in df.columns:
             continue
+        
         if dtype in ("integer", "float", "numeric"):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            # Test conversion on a sample - only apply if we won't lose all data
+            test_converted = pd.to_numeric(df[col], errors="coerce")
+            non_null_ratio = test_converted.notna().sum() / len(test_converted) if len(test_converted) > 0 else 0
+            
+            # Only convert if we keep at least some data (avoid NaN-destroying conversions)
+            if non_null_ratio > 0.1 or (df[col].notna().sum() == 0):
+                # Either: conversion keeps 10%+ of values, OR column is already all-NaN
+                df[col] = test_converted
+            else:
+                # Skip conversion - would destroy valuable data
+                print(f"[labeler] Skipped numeric conversion for '{col}' ({non_null_ratio*100:.1f}% would convert - data preserved as string)", flush=True)
+        
         elif dtype == "datetime":
             df[col] = pd.to_datetime(df[col], errors="coerce")
+        
         elif dtype == "boolean":
             df[col] = (
                 df[col].astype(str).str.lower()
@@ -397,8 +453,30 @@ def _write_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def _make_json_safe(obj: Any) -> Any:
+    """Recursively convert numpy/Path types to JSON-safe equivalents."""
+    if isinstance(obj, dict):
+        return {k: _make_json_safe(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_make_json_safe(item) for item in obj]
+    elif isinstance(obj, Path):
+        return str(obj)
+    elif hasattr(obj, 'item') and callable(obj.item):
+        try:
+            return obj.item()
+        except (TypeError, ValueError):
+            return str(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif hasattr(obj, '__module__') and 'numpy' in obj.__module__:
+        return str(obj)
+    else:
+        return obj
+
+
 def _write_json(path: Path, obj: Any) -> None:
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    safe_obj = _make_json_safe(obj)
+    path.write_text(json.dumps(safe_obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -499,17 +577,127 @@ def run_labeler(
             return summary
 
     # ── Clean the FULL dataset (deterministic, no LLM) ────────────────────
-    print(f"[labeler] Cleaning: {len(df):,} rows × {len(df.columns)} columns", flush=True)
+    print(f"[labeler] Cleaning: {len(df):,} rows x {len(df.columns)} columns", flush=True)
+    
+    # DEBUG: State of df BEFORE cleaning
+    if 'age' in df.columns:
+        print(f"[labeler] DEBUG START: df['age'] has {df['age'].notna().sum()} non-null, {df['age'].isna().sum()} missing BEFORE cleaning", flush=True)
+    
     cleaned, cleaning_metrics = _apply_deterministic_cleaning(df, cleaning_profile)
     
     if not isinstance(cleaned, pd.DataFrame):
         raise RuntimeError("clean_dataframe() did not return a pandas DataFrame.")
+    
+    # DEBUG: State of cleaned AFTER function returns
+    if 'age' in cleaned.columns:
+        print(f"[labeler] DEBUG END: cleaned['age'] has {cleaned['age'].notna().sum()} non-null, {cleaned['age'].isna().sum()} missing AFTER _apply_deterministic_cleaning", flush=True)
 
     print(f"[labeler] Cleaned: {len(cleaned):,} rows × {len(cleaned.columns)} columns", flush=True)
-    print(f"[labeler] Metrics: {json.dumps(cleaning_metrics, indent=2)}", flush=True)
+    
+    # Print metrics (convert numpy types to Python types for JSON serialization)
+    try:
+        # Convert numpy types to native Python types
+        metrics_json_safe = {}
+        for k, v in cleaning_metrics.items():
+            if hasattr(v, 'item'):  # numpy types have .item()
+                metrics_json_safe[k] = v.item()
+            else:
+                metrics_json_safe[k] = v
+        print(f"[labeler] Metrics: {json.dumps(metrics_json_safe, indent=2)}", flush=True)
+    except Exception as e:
+        print(f"[labeler] Warning: Could not serialize metrics for logging: {e}", flush=True)
+        print(f"[labeler] Metrics (raw): {cleaning_metrics}", flush=True)
 
+    
+    # DEBUG: Check age values right before saving
+    if 'age' in cleaned.columns:
+        print(f"[labeler] DEBUG BEFORE CSV SAVE: age has {cleaned['age'].notna().sum()} non-null, {cleaned['age'].isna().sum()} missing", flush=True)
+        print(f"[labeler] DEBUG: age sample before save: {cleaned['age'].head(5).tolist()}", flush=True)
+    
+    # CRITICAL FIX: Ensure we're using the SAME dataframe object throughout
+    # Create explicit copy to prevent any reference issues
+    final_cleaned = cleaned.copy(deep=True)
+    
+    print(f"[labeler] About to save cleaned_data.csv with columns: {list(final_cleaned.columns)}", flush=True)
+    print(f"[labeler] Column dtypes before save: {final_cleaned.dtypes.to_dict()}", flush=True)
+    if 'age' in final_cleaned.columns:
+        print(f"[labeler] FINAL VERIFY: age in final_cleaned: {final_cleaned['age'].notna().sum()} non-null", flush=True)
+    
     cleaned_csv_path = run_dir / "cleaned_data.csv"
-    cleaned.to_csv(cleaned_csv_path, index=False)
+    log_file = run_dir / "labeler_save_debug.txt"
+    
+    # Write comprehensive debug info FIRST
+    try:
+        with open(log_file, 'w') as f:
+            f.write(f"=== CSV SAVE DEBUG LOG ===\n")
+            f.write(f"Timestamp: {dt.datetime.now(dt.timezone.utc).isoformat()}\n")
+            f.write(f"DataFrame shape: {final_cleaned.shape}\n")
+            f.write(f"Columns: {list(final_cleaned.columns)}\n")
+            f.write(f"Dtypes:\n{final_cleaned.dtypes}\n")
+            if 'age' in final_cleaned.columns:
+                f.write(f"\nAge column analysis BEFORE CSV SAVE:\n")
+                f.write(f"  Non-null count: {final_cleaned['age'].notna().sum()}\n")
+                f.write(f"  Null count: {final_cleaned['age'].isna().sum()}\n")
+                f.write(f"  Dtype: {final_cleaned['age'].dtype}\n")
+                f.write(f"  Min: {final_cleaned['age'].min()}\n")
+                f.write(f"  Max: {final_cleaned['age'].max()}\n")
+                f.write(f"  First 10 values: {final_cleaned['age'].head(10).tolist()}\n")
+                f.write(f"  Last 10 values: {final_cleaned['age'].tail(10).tolist()}\n")
+            f.write(f"\n--- ATTEMPTING CSV WRITE ---\n")
+    except Exception as e:
+        print(f"[labeler] [X] ERROR writing debug log: {type(e).__name__}: {str(e)}", flush=True)
+        raise
+    
+    # SIMPLE, ROBUST CSV WRITE with explicit error handling
+    csv_write_success = False
+    try:
+        # Use text mode write instead of pandas to_csv for more control
+        csv_content = final_cleaned.to_csv(index=False)
+        
+        # Write to file with explicit flush
+        with open(cleaned_csv_path, 'w', newline='', encoding='utf-8') as f:
+            f.write(csv_content)
+            f.flush()  # Explicit flush
+        
+        csv_write_success = True
+        print(f"[labeler] [OK] CSV WRITTEN to {cleaned_csv_path} ({len(csv_content)} bytes)", flush=True)
+        
+    except Exception as e:
+        print(f"[labeler] [X] ERROR IN CSV WRITE: {type(e).__name__}: {str(e)}", flush=True)
+        with open(log_file, 'a') as f:
+            f.write(f"\nCSV WRITE ERROR: {type(e).__name__}\n{str(e)}\n")
+        raise
+    
+    # VERIFY: Read back and compare
+    if csv_write_success:
+        try:
+            verify_df = pd.read_csv(cleaned_csv_path)
+            print(f"[labeler] [OK] CSV VERIFIED: {len(verify_df)} rows x {len(verify_df.columns)} columns", flush=True)
+            
+            with open(log_file, 'a') as f:
+                f.write(f"\nCSV WRITE: SUCCESS ({len(csv_content)} bytes written)\n")
+                f.write(f"\nCSV VERIFY RELOAD:\n")
+                f.write(f"  Shape: {verify_df.shape}\n")
+                f.write(f"  Columns: {list(verify_df.columns)}\n")
+                if 'age' in verify_df.columns:
+                    f.write(f"\nAge column analysis AFTER CSV SAVE:\n")
+                    f.write(f"  Non-null count: {verify_df['age'].notna().sum()}\n")
+                    f.write(f"  Null count: {verify_df['age'].isna().sum()}\n")
+                    f.write(f"  Dtype after reload: {verify_df['age'].dtype}\n")
+                    f.write(f"  Min: {verify_df['age'].min()}\n")
+                    f.write(f"  Max: {verify_df['age'].max()}\n")
+                    f.write(f"  First 10 values: {verify_df['age'].head(10).tolist()}\n")
+                    f.write(f"  Last 10 values: {verify_df['age'].tail(10).tolist()}\n")
+            
+            if 'age' in verify_df.columns:
+                print(f"[labeler] DEBUG AFTER CSV RELOAD: age has {verify_df['age'].notna().sum()} non-null, {verify_df['age'].isna().sum()} missing", flush=True)
+                print(f"[labeler] DEBUG: age sample after reload: {verify_df['age'].head(5).tolist()}", flush=True)
+        except Exception as e:
+            print(f"[labeler] [X] ERROR VERIFYING CSV: {type(e).__name__}: {str(e)}", flush=True)
+            with open(log_file, 'a') as f:
+                f.write(f"\nCSV VERIFY ERROR: {type(e).__name__}: {str(e)}\n")
+
+
     
     # ── Mark cache as valid ──────────────────────────────────────────────
     _save_cache_marker(df, cleaning_profile, run_dir)
@@ -578,7 +766,10 @@ def main() -> int:
         out_dir=args.out_dir,
         cleaning_profile=DEFAULT_CLEANING_PROFILE,
     )
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    
+    # Use module-level _make_json_safe to ensure numpy types are properly handled
+    safe_summary = _make_json_safe(summary)
+    print(json.dumps(safe_summary, ensure_ascii=True, indent=2))
     return 0
 
 

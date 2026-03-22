@@ -74,16 +74,32 @@ def _dtype_name(series: pd.Series) -> str:
 
 
 def _infer_dtypes(df: pd.DataFrame) -> pd.DataFrame:
-    """Attempt to upgrade object columns to numeric or datetime."""
+    """Attempt to upgrade object columns to numeric or datetime.
+    
+    IMPORTANT: Only convert if MOST values are actually numeric/datetime.
+    This prevents destroying string columns like Employee_ID, Email, etc.
+    """
     df = df.infer_objects()
     for col in df.select_dtypes(include="object"):
+        # Try datetime first
         try:
             df[col] = pd.to_datetime(df[col], infer_datetime_format=True)
             continue
         except Exception:
             pass
+        
+        # Try numeric ONLY if 70%+ of values can be converted
         try:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+            converted = pd.to_numeric(df[col], errors='coerce')
+            non_null_ratio = converted.notna().sum() / len(converted)
+            
+            # Only apply if majority of values converted successfully (70%+ threshold)
+            # This preserves string columns that accidentally look numeric
+            if non_null_ratio > 0.70:
+                df[col] = converted
+                print(f"[scout] Converted '{col}' to numeric ({non_null_ratio*100:.1f}% values converted)", flush=True)
+            else:
+                print(f"[scout] Keeping '{col}' as string ({non_null_ratio*100:.1f}% values convertible, below 70% threshold)", flush=True)
         except Exception:
             pass
     return df
