@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 import fastapi
+import matplotlib
+# ← FIX: Set non-interactive matplotlib backend FIRST to avoid tkinter threading errors
+matplotlib.use('Agg')  # Use Agg backend (non-interactive, thread-safe)
+
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
@@ -389,6 +393,35 @@ async def get_validation_result(run_id: str):
     return JSONResponse(_read_json_file(result_path))
 
 
+@app.get("/runs/{run_id}/cleaning-metrics")
+async def get_cleaning_metrics(run_id: str):
+    """Get cleaning metrics from phase2_summary.json (labeler phase output)."""
+    state = get_run(run_id)
+    if not state:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Run {run_id} not found"},
+        )
+
+    if not state["labeler_output_dir"]:
+        return JSONResponse(
+            status_code=202,
+            content={"error": "Labeler phase not yet complete"},
+        )
+
+    summary_path = Path(state["labeler_output_dir"]) / "phase2_summary.json"
+    if not summary_path.exists():
+        return JSONResponse(
+            status_code=404,
+            content={"error": "phase2_summary.json not found"},
+        )
+
+    summary = _read_json_file(summary_path)
+    # Extract just the cleaning_metrics field if present
+    metrics = summary.get("cleaning_metrics", {})
+    return JSONResponse(metrics)
+
+
 def _read_json_file(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -424,11 +457,47 @@ def _normalize_token(value: str) -> str:
 
 
 def _extract_columns_from_instruction(instruction: str, columns: list[str]) -> list[str]:
+    """
+    Extract matching column names from instruction using fuzzy matching.
+    Tries multiple matching strategies for better coverage.
+    """
     instruction_norm = _normalize_token(instruction)
+    instruction_words = set(re.findall(r'\b\w+\b', instruction.lower()))
+    
     matched: list[str] = []
+    scored_matches: dict[str, int] = {}
+    
     for col in columns:
-        if _normalize_token(col) and _normalize_token(col) in instruction_norm:
-            matched.append(col)
+        col_norm = _normalize_token(col)
+        col_words = set(re.findall(r'\b\w+\b', col.lower()))
+        
+        if not col_norm:
+            continue
+        
+        score = 0
+        
+        # Strategy 1: Exact substring in normalized version (high confidence)
+        if col_norm in instruction_norm:
+            score += 10
+        
+        # Strategy 2: Word match in original text (medium confidence)
+        for word in col_words:
+            if word in instruction_words:
+                score += 5
+        
+        # Strategy 3: Partial substring match (lower confidence, but catches typos)
+        if any(col_norm.startswith(word) or word.startswith(col_norm[:3]) 
+               for word in instruction_words if len(word) >= 3):
+            score += 2
+        
+        if score > 0:
+            scored_matches[col] = score
+    
+    # Return columns sorted by score (highest first)
+    if scored_matches:
+        matched = sorted(scored_matches.items(), key=lambda x: x[1], reverse=True)
+        matched = [col for col, _ in matched]
+    
     return matched
 
 
@@ -487,158 +556,238 @@ async def get_descriptive_stats(run_id: str):
 async def create_custom_chart(run_id: str, request: CustomChartRequest):
     """
     Generate a custom chart from a natural-language instruction.
+    
+    Supports: histogram, scatter, line, bar charts.
+    Uses fuzzy column matching to find relevant data.
     """
-    state = get_run(run_id)
-    if not state:
-        return JSONResponse(status_code=404, content={"error": f"Run {run_id} not found"})
-
-    csv_path = _resolve_cleaned_csv_path(state)
-    if not csv_path:
-        return JSONResponse(status_code=404, content={"error": "cleaned_data.csv not found"})
-
-    output_dir = _resolve_pipeline_output_dir(state)
-    if not output_dir:
-        return JSONResponse(status_code=404, content={"error": "No output directory found for run"})
-
-    instruction = (request.instruction or "").strip()
-    if not instruction:
-        return JSONResponse(status_code=400, content={"error": "instruction is required"})
-
-    df = pd.read_csv(csv_path)
-    if df.empty:
-        return JSONResponse(status_code=400, content={"error": "cleaned_data.csv is empty"})
-
-    sns.set_theme(style="whitegrid")
-
-    columns = list(df.columns)
-    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-    matched_cols = _extract_columns_from_instruction(instruction, columns)
-    instruction_lc = instruction.lower()
-
-    if "hist" in instruction_lc:
-        chart_type = "histogram"
-    elif "scatter" in instruction_lc:
-        chart_type = "scatter"
-    elif "line" in instruction_lc:
-        chart_type = "line"
-    elif "bar" in instruction_lc:
-        chart_type = "bar"
-    else:
-        chart_type = "scatter" if len(numeric_cols) >= 2 else "histogram"
-
-    timestamp = dt.datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    filename = f"custom_{chart_type}_{timestamp}.png"
-    output_path = output_dir / filename
-
     try:
-        if chart_type == "histogram":
-            col = next((c for c in matched_cols if c in numeric_cols), numeric_cols[0] if numeric_cols else columns[0])
-            data = pd.to_numeric(df[col], errors="coerce").dropna()
-            if data.empty:
-                return JSONResponse(status_code=400, content={"error": f"Column '{col}' has no numeric values for histogram"})
-            fig, ax = plt.subplots(figsize=(10, 5))
-            sns.histplot(data, bins="auto", kde=True, ax=ax)
-            ax.set_title(f"Histogram of {col}")
-            ax.set_xlabel(col)
-            ax.set_ylabel("Count")
-            plt.tight_layout()
-            fig.savefig(output_path, dpi=200)
-            plt.close(fig)
-            columns_used = [col]
-            title = f"Histogram of {col}"
+        state = get_run(run_id)
+        if not state:
+            return JSONResponse(status_code=404, content={"error": f"Run {run_id} not found"})
 
-        elif chart_type in {"scatter", "line"}:
-            x_col = matched_cols[0] if len(matched_cols) >= 1 else (numeric_cols[0] if numeric_cols else columns[0])
-            y_col = matched_cols[1] if len(matched_cols) >= 2 else (numeric_cols[1] if len(numeric_cols) >= 2 else None)
-            if not y_col:
-                return JSONResponse(status_code=400, content={"error": "Need at least two columns for scatter/line chart"})
+        csv_path = _resolve_cleaned_csv_path(state)
+        if not csv_path:
+            return JSONResponse(status_code=404, content={"error": "cleaned_data.csv not found"})
 
-            plot_df = df[[x_col, y_col]].copy()
-            plot_df[y_col] = pd.to_numeric(plot_df[y_col], errors="coerce")
-            plot_df = plot_df.dropna()
-            if plot_df.empty:
-                return JSONResponse(status_code=400, content={"error": f"No plottable rows for {x_col} and {y_col}"})
+        output_dir = _resolve_pipeline_output_dir(state)
+        if not output_dir:
+            return JSONResponse(status_code=404, content={"error": "No output directory found for run"})
 
-            fig, ax = plt.subplots(figsize=(10, 5.5))
-            if chart_type == "scatter":
-                ax.scatter(plot_df[x_col], plot_df[y_col], alpha=0.75)
-                ax.set_title(f"Scatter: {x_col} vs {y_col}")
-            else:
-                ax.plot(plot_df[x_col], plot_df[y_col], linewidth=1.8)
-                ax.set_title(f"Line: {y_col} over {x_col}")
-            ax.set_xlabel(x_col)
-            ax.set_ylabel(y_col)
-            plt.tight_layout()
-            fig.savefig(output_path, dpi=200)
-            plt.close(fig)
-            columns_used = [x_col, y_col]
-            title = f"{chart_type.title()}: {x_col} and {y_col}"
+        instruction = (request.instruction or "").strip()
+        if not instruction:
+            return JSONResponse(status_code=400, content={"error": "instruction is required"})
 
-        else:  # bar
-            if len(matched_cols) >= 2:
-                x_col, y_col = matched_cols[0], matched_cols[1]
-                grouped = (
-                    df[[x_col, y_col]]
-                    .assign(**{y_col: pd.to_numeric(df[y_col], errors="coerce")})
-                    .dropna()
-                    .groupby(x_col, as_index=False)[y_col]
-                    .mean()
-                    .head(20)
-                )
-                if grouped.empty:
-                    return JSONResponse(status_code=400, content={"error": f"No plottable rows for {x_col} and {y_col}"})
-                fig, ax = plt.subplots(figsize=(10, 5.5))
-                sns.barplot(data=grouped, x=x_col, y=y_col, ax=ax)
-                ax.set_title(f"Bar chart: mean {y_col} by {x_col}")
-                ax.tick_params(axis="x", rotation=30)
+        # Load data
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": f"Failed to read CSV: {str(e)}"})
+        
+        if df.empty:
+            return JSONResponse(status_code=400, content={"error": "cleaned_data.csv is empty"})
+
+        sns.set_theme(style="whitegrid")
+
+        columns = list(df.columns)
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        matched_cols = _extract_columns_from_instruction(instruction, columns)
+        instruction_lc = instruction.lower()
+
+        # Determine chart type from instruction keywords
+        if "hist" in instruction_lc or "distribution" in instruction_lc:
+            chart_type = "histogram"
+        elif "scatter" in instruction_lc:
+            chart_type = "scatter"
+        elif "line" in instruction_lc:
+            chart_type = "line"
+        elif "bar" in instruction_lc or "count" in instruction_lc:
+            chart_type = "bar"
+        else:
+            # Default: scatter if 2+ numeric, else histogram
+            chart_type = "scatter" if len(numeric_cols) >= 2 else "histogram"
+
+        timestamp = dt.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        filename = f"custom_{chart_type}_{timestamp}.png"
+        output_path = output_dir / filename
+
+        # Generate chart based on type
+        try:
+            if chart_type == "histogram":
+                # Select numeric column for histogram
+                if matched_cols:
+                    col = next((c for c in matched_cols if c in numeric_cols), None)
+                    if not col and numeric_cols:
+                        col = numeric_cols[0]
+                elif numeric_cols:
+                    col = numeric_cols[0]
+                else:
+                    return JSONResponse(status_code=400, 
+                                      content={"error": "No numeric columns available for histogram. Got: " + ", ".join(columns[:5])})
+
+                # Extract numeric data
+                try:
+                    data = pd.to_numeric(df[col], errors="coerce").dropna()
+                except Exception as e:
+                    return JSONResponse(status_code=400, 
+                                      content={"error": f"Column '{col}' conversion failed: {str(e)}"})
+                
+                if data.empty or len(data) == 0:
+                    return JSONResponse(status_code=400, 
+                                      content={"error": f"Column '{col}' has no numeric values ({len(df)} rows, {len(data)} numeric)"})
+
+                try:
+                    fig, ax = plt.subplots(figsize=(10, 5))
+                    sns.histplot(data, bins="auto", kde=True, ax=ax)
+                    ax.set_title(f"Histogram: {col}")
+                    ax.set_xlabel(col)
+                    ax.set_ylabel("Frequency")
+                    plt.tight_layout()
+                    fig.savefig(output_path, dpi=200, bbox_inches='tight')
+                    plt.close(fig)
+                except Exception as e:
+                    return JSONResponse(status_code=500, 
+                                      content={"error": f"Failed to render histogram: {str(e)}"})
+                
+                columns_used = [col]
+                title = f"Histogram: {col}"
+
+            elif chart_type in {"scatter", "line"}:
+                # Need 2 columns for scatter/line
+                if len(matched_cols) >= 2:
+                    x_col, y_col = matched_cols[0], matched_cols[1]
+                elif len(matched_cols) == 1 and len(numeric_cols) >= 2:
+                    x_col = matched_cols[0]
+                    y_col = next((c for c in numeric_cols if c != x_col), numeric_cols[1] if len(numeric_cols) > 1 else None)
+                elif len(numeric_cols) >= 2:
+                    x_col, y_col = numeric_cols[0], numeric_cols[1]
+                else:
+                    available = ", ".join(columns[:10]) + ("..." if len(columns) > 10 else "")
+                    return JSONResponse(status_code=400, 
+                                      content={"error": f"Need at least 2 columns for {chart_type}. Available: {available}"})
+
+                # Prepare data
+                try:
+                    plot_df = df[[x_col, y_col]].copy()
+                    plot_df[y_col] = pd.to_numeric(plot_df[y_col], errors="coerce")
+                    plot_df = plot_df.dropna()
+                except Exception as e:
+                    return JSONResponse(status_code=400, 
+                                      content={"error": f"Data prep failed for {x_col}/{y_col}: {str(e)}"})
+                
+                if plot_df.empty or len(plot_df) == 0:
+                    return JSONResponse(status_code=400, 
+                                      content={"error": f"No valid data for {x_col} vs {y_col} ({len(df)} rows, {len(plot_df)} after cleaning)"})
+
+                try:
+                    fig, ax = plt.subplots(figsize=(10, 5.5))
+                    if chart_type == "scatter":
+                        ax.scatter(plot_df[x_col], plot_df[y_col], alpha=0.6, s=50)
+                        ax.set_title(f"Scatter: {x_col} vs {y_col}")
+                    else:  # line
+                        ax.plot(plot_df[x_col], plot_df[y_col], linewidth=2, marker='o', markersize=4)
+                        ax.set_title(f"Line Chart: {y_col} over {x_col}")
+                    ax.set_xlabel(x_col)
+                    ax.set_ylabel(y_col)
+                    plt.tight_layout()
+                    fig.savefig(output_path, dpi=200, bbox_inches='tight')
+                    plt.close(fig)
+                except Exception as e:
+                    return JSONResponse(status_code=500, 
+                                      content={"error": f"Failed to render {chart_type}: {str(e)}"})
+                
                 columns_used = [x_col, y_col]
-                title = f"Bar: {y_col} by {x_col}"
+                title = f"{chart_type.title()}: {x_col} and {y_col}"
+
+            else:  # bar chart
+                try:
+                    if len(matched_cols) >= 2:
+                        x_col, y_col = matched_cols[0], matched_cols[1]
+                        bar_df = df[[x_col, y_col]].copy()
+                        bar_df[y_col] = pd.to_numeric(bar_df[y_col], errors="coerce")
+                        grouped = bar_df.dropna().groupby(x_col, as_index=False)[y_col].mean()
+                        
+                        if len(grouped) > 20:
+                            grouped = grouped.nlargest(20, y_col)
+                        
+                        if grouped.empty or len(grouped) == 0:
+                            return JSONResponse(status_code=400, 
+                                              content={"error": f"No valid data for bar chart: {x_col}, {y_col}"})
+                        
+                        fig, ax = plt.subplots(figsize=(10, 5.5))
+                        sns.barplot(data=grouped, x=x_col, y=y_col, ax=ax)
+                        ax.set_title(f"Bar Chart: mean {y_col} by {x_col}")
+                        ax.set_xlabel(x_col)
+                        ax.set_ylabel(y_col)
+                        plt.setp(ax.get_xticklabels(), rotation=30, ha='right')
+                        columns_used = [x_col, y_col]
+                        title = f"Bar: {y_col} by {x_col}"
+                    else:
+                        # Single column bar - show value counts
+                        x_col = matched_cols[0] if matched_cols else columns[0]
+                        counts = df[x_col].astype(str).value_counts().head(20)
+                        
+                        if counts.empty or len(counts) == 0:
+                            return JSONResponse(status_code=400, 
+                                              content={"error": f"No data for bar chart in column: {x_col}"})
+                        
+                        fig, ax = plt.subplots(figsize=(10, 5.5))
+                        sns.barplot(x=counts.index, y=counts.values, ax=ax)
+                        ax.set_title(f"Bar Chart: top values in {x_col}")
+                        ax.set_xlabel(x_col)
+                        ax.set_ylabel("Count")
+                        plt.setp(ax.get_xticklabels(), rotation=30, ha='right')
+                        columns_used = [x_col]
+                        title = f"Bar: top values in {x_col}"
+                    
+                    plt.tight_layout()
+                    fig.savefig(output_path, dpi=200, bbox_inches='tight')
+                    plt.close(fig)
+                except Exception as e:
+                    return JSONResponse(status_code=500, 
+                                      content={"error": f"Failed to render bar chart: {str(e)}"})
+
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": f"Chart generation failed: {str(e)}"})
+
+        # Update viz_summary.json (create if doesn't exist)
+        try:
+            viz_summary_path = output_dir / "viz_summary.json"
+            if viz_summary_path.exists():
+                summary = _read_json_file(viz_summary_path)
             else:
-                x_col = matched_cols[0] if matched_cols else columns[0]
-                counts = df[x_col].astype(str).value_counts().head(20)
-                fig, ax = plt.subplots(figsize=(10, 5.5))
-                sns.barplot(x=counts.index, y=counts.values, ax=ax)
-                ax.set_title(f"Bar chart: top values in {x_col}")
-                ax.set_xlabel(x_col)
-                ax.set_ylabel("Count")
-                ax.tick_params(axis="x", rotation=30)
-                columns_used = [x_col]
-                title = f"Bar: top values in {x_col}"
+                summary = {"charts": [], "timestamp": dt.datetime.utcnow().isoformat()}
+            
+            charts = summary.get("charts", [])
+            charts.append(
+                {
+                    "chart_id": output_path.stem,
+                    "chart_type": chart_type,
+                    "title": title,
+                    "columns_used": columns_used,
+                    "png_path": str(output_path),
+                    "generated_by": "custom_instruction",
+                }
+            )
+            summary["charts"] = charts
+            summary["timestamp"] = dt.datetime.utcnow().isoformat()
+            viz_summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            # Log but don't fail - chart was created successfully
+            print(f"[WARNING] Failed to update viz_summary.json: {e}", flush=True)
 
-            plt.tight_layout()
-            fig.savefig(output_path, dpi=200)
-            plt.close(fig)
-
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Failed to generate chart: {e}"})
-
-    viz_summary_path = output_dir / "viz_summary.json"
-    if viz_summary_path.exists():
-        summary = _read_json_file(viz_summary_path)
-        charts = summary.get("charts", [])
-        charts.append(
+        return JSONResponse(
             {
-                "chart_id": output_path.stem,
+                "run_id": run_id,
+                "filename": filename,
                 "chart_type": chart_type,
-                "title": title,
                 "columns_used": columns_used,
-                "png_path": str(output_path),
-                "generated_by": "custom_instruction",
+                "title": title,
+                "instruction": instruction,
             }
         )
-        summary["charts"] = charts
-        summary["timestamp"] = dt.datetime.utcnow().isoformat()
-        viz_summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    return JSONResponse(
-        {
-            "run_id": run_id,
-            "filename": filename,
-            "chart_type": chart_type,
-            "columns_used": columns_used,
-            "instruction": instruction,
-        }
-    )
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Unexpected error: {str(e)}"})
 
 
 @app.get("/health")

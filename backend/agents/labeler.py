@@ -29,6 +29,12 @@ from pydantic import BaseModel, Field, ValidationError
 
 import numpy as np
 import pandas as pd
+
+# ← FIX: Set non-interactive matplotlib backend FIRST to avoid tkinter threading errors
+# This must happen before any plotting occurs
+import matplotlib
+matplotlib.use('Agg')  # Use Agg backend (non-interactive, thread-safe)
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -72,7 +78,7 @@ class CleaningProfile(BaseModel):
     drop_duplicates: bool = True
     standardize_column_names: bool = True
     auto_detect_dtypes: bool = True
-    fill_missing_strategy: Literal["drop", "ffill", "mean"] = "drop"
+    fill_missing_strategy: Literal["drop", "ffill", "mean", "median"] = "median"
     handle_outliers: bool = False
     outlier_method: Literal["iqr", "zscore"] = "iqr"
 
@@ -82,48 +88,112 @@ DEFAULT_CLEANING_PROFILE = CleaningProfile()
 
 def _apply_deterministic_cleaning(
     df: pd.DataFrame, profile: CleaningProfile = DEFAULT_CLEANING_PROFILE
-) -> pd.DataFrame:
-    """Fast, reproducible data cleaning without LLM. Runs in <1 second."""
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    Fast, reproducible data cleaning without LLM. Runs in <1 second.
+    Returns (cleaned_df, metrics_dict) to track what was removed/cleaned.
+    """
+    metrics = {
+        "rows_input": len(df),
+        "columns_input": len(df.columns),
+        "duplicates_removed": 0,
+        "empty_rows_removed": 0,
+        "empty_columns_removed": 0,
+        "columns_standardized": 0,
+        "missing_values_filled": 0,
+        "outliers_removed": 0,
+    }
 
     # Standardize column names to snake_case
     if profile.standardize_column_names:
+        old_cols = list(df.columns)
         df.columns = [
             re.sub(r'[^a-z0-9]+', '_', str(c).strip().lower()).strip('_')
             for c in df.columns
         ]
+        # Count how many changed
+        metrics["columns_standardized"] = sum(1 for o, n in zip(old_cols, df.columns) if o != n)
 
     # Drop fully empty rows
     if profile.drop_empty_rows:
+        rows_before = len(df)
         df = df.dropna(how='all')
+        metrics["empty_rows_removed"] = rows_before - len(df)
 
     # Drop fully empty columns
     if profile.drop_empty_cols:
+        cols_before = len(df.columns)
         df = df.dropna(axis=1, how='all')
+        metrics["empty_columns_removed"] = cols_before - len(df.columns)
 
     # Remove duplicate rows
     if profile.drop_duplicates:
+        rows_before = len(df)
         df = df.drop_duplicates()
+        metrics["duplicates_removed"] = rows_before - len(df)
+
+    # Auto-detect and convert numeric-looking columns (handles "age" stored as string)
+    for col in df.columns:
+        if df[col].dtype == 'object':  # String/mixed type column
+            # Try to convert to numeric, coerce blanks to NaN
+            converted = pd.to_numeric(df[col], errors='coerce')
+            # Only replace if most values converted successfully (>50%)
+            if converted.notna().sum() / len(df) > 0.5:  # If 50%+ converted
+                df[col] = converted
 
     # Handle missing values
     if profile.fill_missing_strategy == "ffill":
+        missing_before = df.isna().sum().sum()
         df = df.fillna(method="ffill")
+        missing_after = df.isna().sum().sum()
+        metrics["missing_values_filled"] = missing_before - missing_after
     elif profile.fill_missing_strategy == "mean":
         numeric_cols = df.select_dtypes(include=[np.number]).columns
+        missing_before = df.isna().sum().sum()
         for col in numeric_cols:
             df[col].fillna(df[col].mean(), inplace=True)
+        missing_after = df.isna().sum().sum()
+        metrics["missing_values_filled"] = missing_before - missing_after
+    elif profile.fill_missing_strategy == "median":
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        print(f"[labeler] MEDIAN_FILL_DEBUG: Numeric columns found: {list(numeric_cols)}", flush=True)
+        
+        missing_before = df.isna().sum().sum()
+        print(f"[labeler] MEDIAN_FILL_DEBUG: Total missing values before: {missing_before}", flush=True)
+        
+        for col in numeric_cols:
+            col_missing = df[col].isna().sum()
+            col_median = df[col].median()
+            col_non_null = df[col].notna().sum()
+            print(f"[labeler]   Column '{col}': dtype={df[col].dtype}, non-null={col_non_null}, missing={col_missing}, median={col_median}", flush=True)
+            
+            if col_missing > 0:
+                df[col].fillna(col_median, inplace=True)
+                after_fill = df[col].isna().sum()
+                print(f"[labeler]     After fill: remaining missing={after_fill}", flush=True)
+        
+        missing_after = df.isna().sum().sum()
+        metrics["missing_values_filled"] = missing_before - missing_after
+        print(f"[labeler] MEDIAN_FILL_DEBUG: Total missing values after: {missing_after}, filled: {metrics['missing_values_filled']}", flush=True)
 
     # Optional outlier removal
     if profile.handle_outliers:
         numeric_cols = df.select_dtypes(include=[np.number]).columns
         if profile.outlier_method == "iqr":
+            rows_before = len(df)
             for col in numeric_cols:
                 Q1, Q3 = df[col].quantile([0.25, 0.75])
                 IQR = Q3 - Q1
                 lower_bound = Q1 - 1.5 * IQR
                 upper_bound = Q3 + 1.5 * IQR
                 df = df[(df[col] >= lower_bound) & (df[col] <= upper_bound)]
+            metrics["outliers_removed"] = rows_before - len(df)
 
-    return df
+    # Final metrics
+    metrics["rows_output"] = len(df)
+    metrics["columns_output"] = len(df.columns)
+
+    return df, metrics
 
 
 def _make_simple_visual_report(
@@ -380,6 +450,11 @@ def run_labeler(
 
     if df.empty:
         raise RuntimeError("Loaded DataFrame is empty — nothing to clean.")
+    
+    # DEBUG: Show dtypes after loading
+    print(f"[labeler] DEBUG: After loading, columns and dtypes:", flush=True)
+    for col in df.columns:
+        print(f"[labeler]   {col}: {df[col].dtype}, non-null count={df[col].notna().sum()}, null count={df[col].isna().sum()}", flush=True)
 
     # ── Write preview and input copy ──────────────────────────────────────
     df_preview_csv = df.head(8).to_csv(index=False)
@@ -388,12 +463,17 @@ def run_labeler(
 
     # ── Check cache: skip if identical dataset + profile ──────────────────
     print(f"[labeler] Checking cache for duplicate cleaning...", flush=True)
-    if _should_skip_cleaning(df, cleaning_profile, run_dir):
+    # TEMPORARY DEBUG: Disable cache to force cleaning to run
+    if False:  # Cache temporarily disabled
         print(f"[labeler] Dataset+profile already cleaned. Skipping.", flush=True)
         # Load cached result
         cleaned_csv_path = run_dir / "cleaned_data.csv"
         if cleaned_csv_path.exists():
             cleaned = pd.read_csv(cleaned_csv_path)
+            # Compute metrics for the cached result
+            empty_rows = len(df) - len(df.dropna(how='all'))
+            empty_cols = len(df.columns) - len(df.dropna(axis=1, how='all'))
+            duplicates = len(df) - len(df.drop_duplicates())
             summary = {
                 "source": scout.effective_source(),
                 "source_type": scout.source_type,
@@ -403,17 +483,30 @@ def run_labeler(
                 "rows": int(cleaned.shape[0]),
                 "columns": list(map(str, cleaned.columns)),
                 "dtypes": {col: str(cleaned[col].dtype) for col in cleaned.columns},
+                "cleaning_metrics": {
+                    "rows_input": len(df),
+                    "columns_input": len(df.columns),
+                    "rows_output": len(cleaned),
+                    "columns_output": len(cleaned.columns),
+                    "empty_rows_removed": empty_rows,
+                    "empty_columns_removed": empty_cols,
+                    "duplicates_removed": duplicates,
+                    "columns_standardized": 0,
+                    "missing_values_filled": 0,
+                    "outliers_removed": 0,
+                },
             }
             return summary
 
     # ── Clean the FULL dataset (deterministic, no LLM) ────────────────────
     print(f"[labeler] Cleaning: {len(df):,} rows × {len(df.columns)} columns", flush=True)
-    cleaned = _apply_deterministic_cleaning(df, cleaning_profile)
+    cleaned, cleaning_metrics = _apply_deterministic_cleaning(df, cleaning_profile)
     
     if not isinstance(cleaned, pd.DataFrame):
         raise RuntimeError("clean_dataframe() did not return a pandas DataFrame.")
 
     print(f"[labeler] Cleaned: {len(cleaned):,} rows × {len(cleaned.columns)} columns", flush=True)
+    print(f"[labeler] Metrics: {json.dumps(cleaning_metrics, indent=2)}", flush=True)
 
     cleaned_csv_path = run_dir / "cleaned_data.csv"
     cleaned.to_csv(cleaned_csv_path, index=False)
@@ -436,6 +529,7 @@ def run_labeler(
         "rows": int(cleaned.shape[0]),
         "columns": list(map(str, cleaned.columns)),
         "dtypes": {col: str(cleaned[col].dtype) for col in cleaned.columns},
+        "cleaning_metrics": cleaning_metrics,  # ← NEW: Track what was cleaned
     }
     _write_json(run_dir / "phase2_summary.json", summary)
     return summary

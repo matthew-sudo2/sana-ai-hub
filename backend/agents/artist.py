@@ -31,6 +31,12 @@ from pydantic import BaseModel, Field
 
 import numpy as np
 import pandas as pd
+
+# ← FIX: Set non-interactive matplotlib backend FIRST to avoid tkinter threading errors
+# This must happen before any plotting occurs
+import matplotlib
+matplotlib.use('Agg')  # Use Agg backend (non-interactive, thread-safe)
+
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import seaborn as sns

@@ -83,7 +83,7 @@ def _infer_dtypes(df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             pass
         try:
-            df[col] = pd.to_numeric(df[col])
+            df[col] = pd.to_numeric(df[col], errors='coerce')
         except Exception:
             pass
     return df

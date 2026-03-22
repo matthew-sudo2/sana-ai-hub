@@ -1,4 +1,4 @@
-import { Download, Loader, SendHorizontal } from "lucide-react";
+import { Download, Loader, SendHorizontal, Eye, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { usePipeline } from "@/context/PipelineContext";
 import { fetchImagesList, generateCustomChart, getImageURL } from "@/lib/api";
@@ -10,6 +10,7 @@ const GalleryPanel = () => {
   const [instruction, setInstruction] = useState("");
   const [customLoading, setCustomLoading] = useState(false);
   const [displayImages, setDisplayImages] = useState<string[]>(images);
+  const [viewingImage, setViewingImage] = useState<string | null>(null);
 
   useEffect(() => {
     setDisplayImages(images);
@@ -68,33 +69,33 @@ const GalleryPanel = () => {
         </span>
       </div>
 
-      <div className="flex-1 space-y-3 overflow-auto p-4">
-        <div className="rounded-md border bg-card p-3">
-          <p className="mb-2 font-display text-[11px] font-semibold text-foreground">Visualization Instructions</p>
+      <div className="flex-1 overflow-auto p-4">
+        <div className="rounded-lg border bg-card p-4 mb-4 shadow-sm">
+          <p className="mb-3 font-display text-xs font-semibold text-foreground uppercase tracking-wide">Create Custom Visualization</p>
           <div className="flex items-center gap-2">
             <input
               value={instruction}
               onChange={(e) => setInstruction(e.target.value)}
-              placeholder="e.g. plot sepallengthcm and petallengthcm as bar chart"
-              className="h-8 flex-1 rounded-md border bg-background px-2 text-xs text-foreground outline-none ring-offset-background placeholder:text-muted-foreground focus-visible:ring-1 focus-visible:ring-ring"
+              placeholder="e.g., plot salary vs department as bar chart"
+              className="h-9 flex-1 rounded-lg border bg-background px-3 text-sm text-foreground outline-none ring-offset-background placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-primary/50"
             />
             <button
               onClick={handleGenerateCustomChart}
               disabled={!runId || customLoading || !instruction.trim()}
-              className="flex h-8 items-center gap-1 rounded-md border px-2 text-[11px] text-muted-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+              className="flex h-9 w-9 items-center justify-center rounded-lg border bg-primary/10 text-primary transition-all hover:bg-primary/20 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {customLoading ? <Loader className="h-3.5 w-3.5 animate-spin" /> : <SendHorizontal className="h-3.5 w-3.5" />}
-              Plot
+              {customLoading ? <Loader className="h-4 w-4 animate-spin" /> : <SendHorizontal className="h-4 w-4" />}
             </button>
           </div>
+          <p className="mt-2 font-body text-xs text-muted-foreground">💡 Tip: Use column names, chart type (bar, scatter, line), and conditions</p>
         </div>
 
         {displayImages.length === 0 ? (
           <div className="flex h-full items-center justify-center">
             {isLoading ? (
-              <div className="space-y-3 w-full">
-                {[...Array(3)].map((_, i) => (
-                  <div key={i} className="h-40 bg-muted animate-pulse rounded" />
+              <div className="grid grid-cols-2 gap-4 w-full">
+                {[...Array(4)].map((_, i) => (
+                  <div key={i} className="h-48 bg-muted animate-pulse rounded-lg" />
                 ))}
               </div>
             ) : (
@@ -104,51 +105,104 @@ const GalleryPanel = () => {
             )}
           </div>
         ) : (
-          displayImages.map((filename) => (
-            <div
-              key={filename}
-              className="group rounded-md border bg-card transition-colors duration-150 hover:border-muted-foreground/30 overflow-hidden"
-            >
-              {/* Image Preview */}
-              <div className="flex h-56 items-center justify-center bg-muted/50 p-2 overflow-hidden">
-                {runId ? (
-                  <img
-                    src={getImageURL(runId, filename)}
-                    alt={filename}
-                    className="max-h-full w-full object-contain"
-                  />
-                ) : (
-                  <span className="text-muted-foreground">No run ID</span>
-                )}
-              </div>
+          <div className="grid grid-cols-2 gap-4">
+            {displayImages.map((filename) => (
+              <div
+                key={filename}
+                className="group rounded-lg border bg-card overflow-hidden cursor-pointer transition-all duration-300 hover:border-primary/50 hover:shadow-lg"
+              >
+                {/* Image Preview - Full Size */}
+                <div className="relative h-48 bg-muted/30 overflow-hidden">
+                  {runId ? (
+                    <>
+                      <img
+                        src={getImageURL(runId, filename)}
+                        alt={filename}
+                        className="h-full w-full object-cover"
+                      />
+                      {/* Enhanced Hover Overlay with Actions */}
+                      <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-black/20 to-transparent opacity-0 group-hover:opacity-100 transition-all duration-300 flex items-end justify-center pb-4 gap-3">
+                        <button
+                          onClick={() => setViewingImage(filename)}
+                          className="flex h-9 w-9 items-center justify-center rounded-full bg-white/95 text-black transition-all hover:bg-white hover:scale-110 shadow-lg"
+                          title="View full screen"
+                        >
+                          <Eye className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={() => handleDownload(filename)}
+                          className="flex h-9 w-9 items-center justify-center rounded-full bg-white/95 text-black transition-all hover:bg-white hover:scale-110 shadow-lg"
+                          title="Download image"
+                        >
+                          <Download className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <span className="text-muted-foreground text-sm">No run ID</span>
+                  )}
+                </div>
 
-              <div className="p-3">
-                <div className="flex items-start justify-between gap-2">
-                  <div>
-                    <p className="font-display text-xs font-semibold text-foreground truncate">
-                      {filename}
-                    </p>
-                    <p className="mt-0.5 font-body text-[11px] text-muted-foreground truncate">
-                      Generated visualization
-                    </p>
-                  </div>
-                  <button
-                    onClick={() => handleDownload(filename)}
-                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border text-muted-foreground opacity-0 transition-all duration-150 hover:bg-muted group-hover:opacity-100"
-                  >
-                    <Download className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-                <div className="mt-2">
-                  <span className="rounded-sm bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-                    PNG Image
-                  </span>
+                {/* Label Footer */}
+                <div className="p-2 border-t bg-card/50">
+                  <p className="font-display text-xs font-semibold text-foreground truncate">
+                    {filename}
+                  </p>
                 </div>
               </div>
-            </div>
-          ))
+            ))}
+          </div>
         )}
       </div>
+
+      {/* Fullscreen Image Viewer Modal */}
+      {viewingImage && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
+          onClick={() => setViewingImage(null)}
+        >
+          <div className="relative max-w-4xl w-full h-5/6 bg-background rounded-lg overflow-hidden flex flex-col" onClick={(e) => e.stopPropagation()}>
+            {/* Header */}
+            <div className="flex items-center justify-between border-b px-6 py-4 bg-muted/20">
+              <h3 className="font-display text-sm font-semibold text-foreground truncate">{viewingImage}</h3>
+              <button
+                onClick={() => setViewingImage(null)}
+                className="flex h-9 w-9 items-center justify-center rounded-md border text-muted-foreground transition-colors hover:bg-muted"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            {/* Image */}
+            <div className="flex-1 flex items-center justify-center bg-muted/50 overflow-auto p-4">
+              {runId && (
+                <img
+                  src={getImageURL(runId, viewingImage)}
+                  alt={viewingImage}
+                  className="max-h-full max-w-full object-contain"
+                />
+              )}
+            </div>
+
+            {/* Footer with Download Button */}
+            <div className="border-t px-6 py-4 bg-muted/20 flex items-center justify-end gap-2">
+              <button
+                onClick={() => handleDownload(viewingImage)}
+                className="flex h-9 items-center gap-2 rounded-md border px-4 text-sm text-muted-foreground transition-colors hover:bg-muted"
+              >
+                <Download className="h-4 w-4" />
+                Download
+              </button>
+              <button
+                onClick={() => setViewingImage(null)}
+                className="flex h-9 items-center gap-2 rounded-md border px-4 text-sm text-muted-foreground transition-colors hover:bg-muted"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
