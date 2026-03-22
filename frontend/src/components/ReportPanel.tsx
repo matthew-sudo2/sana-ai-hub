@@ -63,99 +63,115 @@ const ReportPanel = () => {
   const cleanContent = sanitizeReportContent(reportContent || "");
 
   return (
-    <div className="flex h-full flex-col">
-      <div className="flex items-center justify-between border-b px-4 py-3">
-        <h3 className="font-display text-sm font-semibold text-foreground">
-          {isComplete ? "Validation Report" : "Report"}
-        </h3>
-        {isComplete && (
-          <div className="flex items-center gap-1.5">
-            <BadgeCheck className="h-4 w-4 text-success" />
-            <span className="font-display text-[11px] font-semibold text-success">Complete</span>
-          </div>
-        )}
-      </div>
-
-      <div className="flex-1 overflow-auto p-5 bg-background">
-        {isLoading || !reportContent ? (
-          <div className="flex h-full items-center justify-center">
-            <div className="text-center">
-              {isLoading ? (
-                <>
-                  <Loader className="h-6 w-6 animate-spin text-muted-foreground mx-auto mb-2" />
-                  <p className="text-sm text-muted-foreground">Generating validation report...</p>
-                </>
-              ) : (
-                <p className="text-sm text-muted-foreground">
-                  {phase === "pending"
-                    ? "Start the pipeline to generate a report"
-                    : "Report will appear here"}
-                </p>
-              )}
+    <div className="flex h-full flex-col bg-background">
+      <div className="flex-1 overflow-auto">
+        <div className="px-6 py-4">
+          {isLoading || !reportContent ? (
+            <div className="flex h-full items-center justify-center py-16">
+              <div className="text-center">
+                {isLoading ? (
+                  <>
+                    <Loader className="h-8 w-8 animate-spin text-muted-foreground mx-auto mb-3" />
+                    <p className="text-sm text-muted-foreground">Generating validation report...</p>
+                  </>
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    {phase === "pending"
+                      ? "Start the pipeline to generate a report"
+                      : "Report will appear here"}
+                  </p>
+                )}
+              </div>
             </div>
-          </div>
-        ) : (
-          <div className="rounded-md border bg-card p-6 shadow-sm prose prose-sm dark:prose-invert max-w-none overflow-x-auto">
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              components={{
-                h1: ({ node, ...props }) => (
-                  <h1 className="font-display text-lg font-bold text-foreground mb-4 break-words" {...props} />
-                ),
-                h2: ({ node, ...props }) => (
-                  <h2 className="font-display text-base font-bold text-foreground mt-4 mb-2 break-words" {...props} />
-                ),
-                h3: ({ node, ...props }) => (
-                  <h3 className="font-display text-sm font-semibold text-foreground mt-3 mb-1 break-words" {...props} />
-                ),
-                p: ({ node, ...props }) => <p className="text-sm leading-relaxed mb-3 break-words" {...props} />,
-                ul: ({ node, ...props }) => <ul className="list-disc list-inside space-y-1 mb-3" {...props} />,
-                ol: ({ node, ...props }) => <ol className="list-decimal list-inside space-y-1 mb-3" {...props} />,
-                li: ({ node, ...props }) => <li className="text-sm break-words" {...props} />,
-                code: ({ node, inline, ...props }) =>
-                  inline ? (
-                    <code className="bg-muted px-1.5 py-0.5 rounded text-xs font-mono break-words" {...props} />
-                  ) : (
-                    <code className="bg-muted p-3 rounded block text-xs font-mono overflow-auto mb-3 break-words" {...props} />
-                  ),
-                table: ({ node, ...props }) => (
-                  <div className="overflow-x-auto mb-3">
-                    <table className="w-full text-sm border-collapse" {...props} />
+          ) : (
+            <>
+              {isComplete && (
+                <div className="mb-6 flex items-start gap-3 rounded-lg border border-success/30 bg-success/5 p-4">
+                  <BadgeCheck className="h-5 w-5 text-success mt-0.5 flex-shrink-0" />
+                  <div className="flex-1">
+                    <p className="font-display text-sm font-semibold text-foreground">Validation Complete</p>
+                    <p className="font-body text-xs text-muted-foreground mt-1">All validation checks passed successfully</p>
                   </div>
-                ),
-                td: ({ node, ...props }) => (
-                  <td className="border border-muted px-2 py-1 text-xs break-words" {...props} />
-                ),
-                th: ({ node, ...props }) => (
-                  <th className="border border-muted bg-muted px-2 py-1 text-xs font-semibold break-words" {...props} />
-                ),
-                blockquote: ({ node, ...props }) => (
-                  <blockquote className="border-l-4 border-success pl-4 text-sm italic my-3 break-words" {...props} />
-                ),
-              }}
-            >
-              {cleanContent}
-            </ReactMarkdown>
-          </div>
-        )}
+                </div>
+              )}
+              
+              <div className="rounded-lg border bg-card shadow-sm prose prose-sm dark:prose-invert max-w-none">
+                <div className="p-6">
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{
+                      h1: ({ node, ...props }) => (
+                        <h1 className="font-display text-xl font-bold text-foreground mb-4 mt-6 first:mt-0" {...props} />
+                      ),
+                      h2: ({ node, ...props }) => (
+                        <h2 className="font-display text-lg font-bold text-foreground mt-6 mb-3" {...props} />
+                      ),
+                      h3: ({ node, ...props }) => (
+                        <h3 className="font-display text-base font-semibold text-foreground mt-5 mb-2" {...props} />
+                      ),
+                      p: ({ node, ...props }) => <p className="text-sm leading-relaxed mb-3 text-foreground" {...props} />,
+                      ul: ({ node, ...props }) => <ul className="list-disc list-inside space-y-1 mb-3 text-sm" {...props} />,
+                      ol: ({ node, ...props }) => <ol className="list-decimal list-inside space-y-1 mb-3 text-sm" {...props} />,
+                      li: ({ node, ...props }) => <li className="text-sm text-foreground" {...props} />,
+                      code: ({ node, inline, ...props }) =>
+                        inline ? (
+                          <code className="bg-muted px-2 py-1 rounded text-xs font-mono text-primary" {...props} />
+                        ) : (
+                          <code className="bg-muted p-3 rounded block text-xs font-mono overflow-auto mb-3 text-primary" {...props} />
+                        ),
+                      table: ({ node, ...props }) => (
+                        <div className="overflow-x-auto mb-4 rounded-lg border">
+                          <table className="w-full text-sm" {...props} />
+                        </div>
+                      ),
+                      td: ({ node, ...props }) => (
+                        <td className="border px-3 py-2 text-xs text-foreground" {...props} />
+                      ),
+                      th: ({ node, ...props }) => (
+                        <th className="border bg-muted px-3 py-2 text-xs font-semibold text-foreground text-left" {...props} />
+                      ),
+                      blockquote: ({ node, ...props }) => (
+                        <blockquote className="border-l-4 border-primary pl-4 text-sm italic my-3 text-muted-foreground" {...props} />
+                      ),
+                      hr: () => <hr className="my-4 border-t border-border" />,
+                    }}
+                  >
+                    {cleanContent}
+                  </ReactMarkdown>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
       </div>
 
+      {/* Footer Actions */}
       {reportContent && !isLoading && (
-        <div className="flex items-center gap-2 border-t px-4 py-3">
-          <button
-            onClick={handleCopy}
-            className="flex h-8 items-center gap-1.5 rounded-md border px-3 font-display text-[11px] font-medium text-muted-foreground transition-colors duration-150 hover:bg-muted"
-          >
-            <Copy className="h-3.5 w-3.5" />
-            Copy
-          </button>
-          <button
-            onClick={handleExport}
-            className="flex h-8 items-center gap-1.5 rounded-md border px-3 font-display text-[11px] font-medium text-muted-foreground transition-colors duration-150 hover:bg-muted"
-          >
-            <Download className="h-3.5 w-3.5" />
-            Export
-          </button>
+        <div className="border-t bg-card/50 px-6 py-3 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            {isComplete && (
+              <span className="flex items-center gap-1 text-xs">
+                <span className="h-2 w-2 rounded-full bg-success"></span>
+                <span className="text-muted-foreground">Report Complete</span>
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleCopy}
+              className="flex h-8 items-center gap-1.5 rounded-md border px-3 font-display text-xs font-medium text-muted-foreground hover:bg-muted transition-colors"
+            >
+              <Copy className="h-3.5 w-3.5" />
+              Copy
+            </button>
+            <button
+              onClick={handleExport}
+              className="flex h-8 items-center gap-1.5 rounded-md border px-3 font-display text-xs font-medium text-muted-foreground hover:bg-muted transition-colors"
+            >
+              <Download className="h-3.5 w-3.5" />
+              Export
+            </button>
+          </div>
         </div>
       )}
     </div>
