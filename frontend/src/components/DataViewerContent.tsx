@@ -418,39 +418,104 @@ const DataViewerContent = () => {
                 </table>
               </div>
 
-              {/* Pagination */}
+              {/* Pagination with inline page numbers - stays on one line */}
               {totalPages > 1 && (
-                <div className="mt-4 flex flex-col items-center justify-center gap-3">
-                  <span className="text-xs text-muted-foreground">
-                    Page {currentPage} of {totalPages}
+                <div className="mt-4 flex items-center gap-4">
+                  <span className="text-xs text-muted-foreground whitespace-nowrap">
+                    {startIdx + 1} - {Math.min(startIdx + rowsPerPage, sortedRows.length)} of {sortedRows.length}
                   </span>
-                  <div className="flex flex-wrap justify-center gap-1">
+                  <div className="flex items-center gap-1 overflow-x-auto pb-1" style={{ flexWrap: "nowrap" }}>
+                    {/* Previous Button */}
                     <button
                       onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
                       disabled={currentPage === 1}
-                      className="flex h-8 w-8 items-center justify-center rounded border text-xs font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      className="flex h-8 w-8 items-center justify-center rounded border text-xs font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 flex-shrink-0"
                     >
                       <ChevronLeft className="h-4 w-4" />
                     </button>
-                    {Array.from({ length: totalPages }, (_, i) => i + 1).map((page) => (
-                      <button
-                        key={page}
-                        onClick={() => setCurrentPage(page)}
-                        className={`flex h-8 w-8 items-center justify-center rounded border text-xs font-medium transition-colors ${
-                          currentPage === page
-                            ? "border-primary bg-primary text-primary-foreground"
-                            : "hover:bg-muted"
-                        }`}
-                      >
-                        {page}
-                      </button>
-                    ))}
+
+                    {/* Page Numbers */}
+                    {(() => {
+                      const pageNumbers = [];
+                      const maxVisible = 9; // Max page buttons to show
+                      let startPage = 1;
+                      let endPage = totalPages;
+
+                      if (totalPages > maxVisible) {
+                        // Show first 3 pages, current page ± 2, last 3 pages
+                        if (currentPage <= 4) {
+                          endPage = 5;
+                        } else if (currentPage >= totalPages - 3) {
+                          startPage = totalPages - 4;
+                        } else {
+                          startPage = currentPage - 2;
+                          endPage = currentPage + 2;
+                        }
+                      }
+
+                      // Add first pages
+                      if (startPage > 1) {
+                        pageNumbers.push(1);
+                        if (startPage > 2) {
+                          pageNumbers.push("...");
+                        }
+                      }
+
+                      // Add page range
+                      for (let i = startPage; i <= endPage; i++) {
+                        pageNumbers.push(i);
+                      }
+
+                      // Add last pages
+                      if (endPage < totalPages) {
+                        if (endPage < totalPages - 1) {
+                          pageNumbers.push("...");
+                        }
+                        pageNumbers.push(totalPages);
+                      }
+
+                      return pageNumbers.map((page, idx) => {
+                        if (page === "...") {
+                          return (
+                            <span key={`dots-${idx}`} className="px-2 text-xs text-muted-foreground flex-shrink-0">
+                              •••
+                            </span>
+                          );
+                        }
+                        const isCurrentPage = page === currentPage;
+                        return (
+                          <button
+                            key={page}
+                            onClick={() => setCurrentPage(page as number)}
+                            className={`flex h-8 w-8 rounded border text-xs font-medium transition-colors items-center justify-center flex-shrink-0 ${
+                              isCurrentPage
+                                ? "border-primary bg-primary text-primary-foreground"
+                                : "hover:bg-muted"
+                            }`}
+                          >
+                            {page}
+                          </button>
+                        );
+                      });
+                    })()}
+
+                    {/* Next Button */}
                     <button
                       onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))}
                       disabled={currentPage === totalPages}
-                      className="flex h-8 w-8 items-center justify-center rounded border text-xs font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      className="flex h-8 w-8 items-center justify-center rounded border text-xs font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 flex-shrink-0"
                     >
                       <ChevronRight className="h-4 w-4" />
+                    </button>
+
+                    {/* End Button */}
+                    <button
+                      onClick={() => setCurrentPage(totalPages)}
+                      disabled={currentPage === totalPages}
+                      className="ml-2 px-3 h-8 rounded border text-xs font-medium bg-background text-foreground hover:bg-muted disabled:opacity-50 flex-shrink-0 whitespace-nowrap"
+                      title="Jump to last page"
+                    >
+                      End
                     </button>
                   </div>
                 </div>
