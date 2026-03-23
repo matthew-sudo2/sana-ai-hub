@@ -7,11 +7,13 @@ import ReportPanel from "@/components/ReportPanel";
 import DataViewerContent from "@/components/DataViewerContent";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Image, Eye, CheckCircle } from "lucide-react";
+import { Image, Eye, CheckCircle, ArrowLeft } from "lucide-react";
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 
 const Index = () => {
   const [activeTab, setActiveTab] = useState("gallery");
+  const navigate = useNavigate();
 
   return (
     <div className="flex min-h-screen bg-background">
@@ -21,9 +23,18 @@ const Index = () => {
       <div className="ml-16 flex flex-1 flex-col">
         {/* Top bar with branding */}
         <header className="flex items-center justify-between border-b bg-card/50 px-6 py-4 backdrop-blur-sm">
-          <div className="flex-1">
-            <h1 className="font-display text-lg font-bold text-foreground">Sana All May Label</h1>
-            <p className="font-body text-xs text-muted-foreground">5-Agent Data Pipeline</p>
+          <div className="flex items-center gap-4 flex-1">
+            <button
+              onClick={() => navigate("/")}
+              className="flex items-center justify-center h-9 w-9 rounded-md text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+              title="Back to Home"
+            >
+              <ArrowLeft className="h-5 w-5" />
+            </button>
+            <div>
+              <h1 className="font-display text-lg font-bold text-foreground">Sana All May Label</h1>
+              <p className="font-body text-xs text-muted-foreground">5-Agent Data Pipeline</p>
+            </div>
           </div>
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2 text-xs">
@@ -34,23 +45,35 @@ const Index = () => {
         </header>
 
         {/* Progress Tracker */}
-        <div className="border-b">
-          <ErrorBoundary>
-            <ProgressTracker />
-          </ErrorBoundary>
+        <div>
+          <div className="px-4 sm:px-6 lg:px-8">
+            <div className="mx-auto max-w-7xl">
+              <ErrorBoundary>
+                <ProgressTracker />
+              </ErrorBoundary>
+            </div>
+          </div>
         </div>
 
         {/* Input Zone */}
-        <div className="border-b">
-          <ErrorBoundary>
-            <InputZone />
-          </ErrorBoundary>
+        <div>
+          <div className="px-4 sm:px-6 lg:px-8">
+            <div className="mx-auto max-w-7xl">
+              <ErrorBoundary>
+                <InputZone />
+              </ErrorBoundary>
+            </div>
+          </div>
         </div>
 
         {/* Phase Status */}
-        <ErrorBoundary>
-          <PhaseStatus />
-        </ErrorBoundary>
+        <div className="px-4 sm:px-6 lg:px-8">
+          <div className="mx-auto max-w-7xl">
+            <ErrorBoundary>
+              <PhaseStatus />
+            </ErrorBoundary>
+          </div>
+        </div>
 
         {/* Tab-based content layout */}
         <div className="flex flex-1 flex-col overflow-hidden">
@@ -60,8 +83,9 @@ const Index = () => {
             className="flex flex-1 flex-col"
           >
             {/* Tab Navigation */}
-            <div className="border-b bg-background/50 backdrop-blur-sm px-6">
-              <TabsList className="h-12 w-full justify-start rounded-none border-0 bg-transparent p-0">
+            <div className="border-b bg-background/50 backdrop-blur-sm px-4 sm:px-6 lg:px-8">
+              <div className="mx-auto max-w-7xl">
+                <TabsList className="h-12 w-full justify-center rounded-none border-0 bg-transparent p-0">
                 <TabsTrigger
                   value="gallery"
                   className="relative h-12 rounded-none border-b-2 border-transparent bg-transparent px-4 font-display text-sm font-medium text-muted-foreground transition-all hover:text-foreground data-[state=active]:border-primary data-[state=active]:text-foreground data-[state=active]:shadow-none"
@@ -81,9 +105,10 @@ const Index = () => {
                   className="relative h-12 rounded-none border-b-2 border-transparent bg-transparent px-4 font-display text-sm font-medium text-muted-foreground transition-all hover:text-foreground data-[state=active]:border-primary data-[state=active]:text-foreground data-[state=active]:shadow-none"
                 >
                   <CheckCircle className="mr-2 h-4 w-4" />
-                  Validation Report
+                  Analysis Report
                 </TabsTrigger>
-              </TabsList>
+                </TabsList>
+              </div>
             </div>
 
             {/* Visual Gallery Tab */}

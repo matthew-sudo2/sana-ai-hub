@@ -56,9 +56,10 @@ const GalleryPanel = () => {
   return (
     <div className="flex h-full flex-col bg-background">
       <div className="flex-1 overflow-auto">
-        <div className="px-6 py-4">
-          {/* Custom Visualization Creator */}
-          <div className="mb-6 rounded-lg border bg-card p-5 shadow-sm">
+        <div className="px-4 sm:px-6 lg:px-8 py-4">
+          <div className="mx-auto max-w-7xl">
+            {/* Custom Visualization Creator */}
+            <div className="mb-6 rounded-lg border bg-card p-5 shadow-sm">
             <p className="mb-3 font-display text-xs font-semibold text-foreground uppercase tracking-wide">CREATE CUSTOM VISUALIZATION</p>
             <div className="flex items-center gap-2 mb-2">
               <input
@@ -109,14 +110,14 @@ const GalleryPanel = () => {
                 )}
               </div>
             ) : (
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {displayImages.map((filename) => (
                   <div
                     key={filename}
                     className="group relative rounded-lg border bg-card overflow-hidden shadow-sm transition-all hover:border-primary/50 hover:shadow-md"
                   >
                     {/* Image Container */}
-                    <div className="relative h-56 bg-muted/20 overflow-hidden">
+                    <div className="relative h-40 bg-muted/20 overflow-hidden">
                       {runId ? (
                         <>
                           <img
@@ -159,6 +160,7 @@ const GalleryPanel = () => {
                 ))}
               </div>
             )}
+          </div>
           </div>
         </div>
       </div>

@@ -1,8 +1,11 @@
-import { ChevronLeft, ChevronRight, Download, Loader, Search, ArrowUp, ArrowDown } from "lucide-react";
+import { ChevronLeft, ChevronRight, Download, Loader, Search, ArrowUp, ArrowDown, Activity } from "lucide-react";
 import { useEffect, useState, useMemo } from "react";
 import { usePipeline } from "@/context/PipelineContext";
 import { downloadCSV } from "@/lib/api";
 import { useToast } from "@/hooks/use-toast";
+import StatisticsPanel from "@/components/StatisticsPanel";
+import ColumnSelector from "@/components/ColumnSelector";
+import { calculateMultipleColumnStats, ColumnStatistics } from "@/lib/statistics";
 
 const DataViewerContent = () => {
   const { csvData, isLoading, runId } = usePipeline();
@@ -13,6 +16,10 @@ const DataViewerContent = () => {
   const [sortBy, setSortBy] = useState("none");
   const [sortOrder, setSortOrder] = useState("ascending");
   const [visibleColumns, setVisibleColumns] = useState<string[]>([]);
+  const [showColumnSelector, setShowColumnSelector] = useState(false);
+  const [showStatistics, setShowStatistics] = useState(false);
+  const [selectedColumns, setSelectedColumns] = useState<string[]>([]);
+  const [calculatedStats, setCalculatedStats] = useState<ColumnStatistics[]>([]);
 
   const rows = csvData || [];
   const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
@@ -195,11 +202,40 @@ const DataViewerContent = () => {
     });
   };
 
+  const handleOpenStatistics = () => {
+    setShowColumnSelector(true);
+    setSelectedColumns([]);
+  };
+
+  const handleAnalyzeColumns = () => {
+    if (selectedColumns.length === 0) {
+      toast({
+        title: "No columns selected",
+        description: "Please select at least one column to analyze",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const stats = calculateMultipleColumnStats(rows, selectedColumns);
+    setCalculatedStats(stats);
+    setShowColumnSelector(false);
+    setShowStatistics(true);
+  };
+
+  const handleCloseStatistics = () => {
+    setShowStatistics(false);
+    setCalculatedStats([]);
+  };
+
   return (
     <div className="flex flex-col h-full bg-background">
-      {/* Stats Cards */}
-      {rows.length > 0 && (
-        <div className="grid grid-cols-4 gap-4 border-b bg-card/50 px-6 py-4">
+      <div className="flex-1 overflow-auto">
+        <div className="px-4 sm:px-6 lg:px-8 py-4">
+          <div className="mx-auto max-w-7xl">
+            {/* Stats Cards */}
+            {rows.length > 0 && (
+              <div className="grid grid-cols-4 gap-4 mb-4">
           <div className="rounded-lg border bg-card p-4 shadow-sm">
             <p className="font-body text-xs text-muted-foreground mb-1">Total Rows</p>
             <p className="font-display text-2xl font-bold text-foreground">{stats.totalRows.toLocaleString()}</p>
@@ -218,11 +254,19 @@ const DataViewerContent = () => {
           </div>
         </div>
       )}
-
-      {/* Column Quality Grid */}
-      {rows.length > 0 && (
-        <div className="border-b bg-background px-6 py-4">
-          <h3 className="mb-3 font-display text-xs font-semibold text-foreground uppercase tracking-wide">Column Quality</h3>
+            {/* Statistics Panel - positioned above Column Quality */}
+            {showStatistics && (
+              <div className="mb-4 rounded-lg border bg-card p-4 shadow-sm">
+                <StatisticsPanel
+                  stats={calculatedStats}
+                  onClose={handleCloseStatistics}
+                />
+              </div>
+            )}
+            {/* Column Quality Grid */}
+            {rows.length > 0 && (
+              <div className="border-b bg-background py-4 mb-4">
+                <h3 className="mb-3 font-display text-xs font-semibold text-foreground uppercase tracking-wide">Column Quality</h3>
           <div className="grid auto-rows-auto gap-2" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))" }}>
             {columns.map((col) => {
               const quality = columnQuality[col];
@@ -255,24 +299,33 @@ const DataViewerContent = () => {
                 </div>
               );
             })}
-          </div>
-        </div>
-      )}
+              </div>
+            </div>
+            )}
 
-      {/* Data Controls */}
-      {rows.length > 0 && (
-        <div className="border-b bg-background px-6 py-4">
-          <div className="flex items-center justify-between mb-3">
+            {/* Data Controls */}
+            {rows.length > 0 && (
+              <div className="border-b bg-background py-4">
+                <div className="flex items-center justify-between mb-3">
             <h3 className="font-display text-xs font-semibold text-foreground uppercase tracking-wide">Data Controls</h3>
-            <button
-              onClick={handleExport}
-              className="flex items-center gap-1 text-xs font-medium text-primary hover:text-primary/80 transition-colors"
-            >
-              <Download className="h-3 w-3" />
-              Export CSV
-            </button>
-          </div>
-          <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleOpenStatistics}
+                      className="flex items-center gap-1 text-xs font-medium text-primary hover:text-primary/80 transition-colors"
+                    >
+                      <Activity className="h-3 w-3" />
+                      Statistics
+                    </button>
+                    <button
+                      onClick={handleExport}
+                      className="flex items-center gap-1 text-xs font-medium text-primary hover:text-primary/80 transition-colors"
+                    >
+                      <Download className="h-3 w-3" />
+                      Export CSV
+                    </button>
+                  </div>
+                </div>
+                <div className="space-y-2">
             <div>
               <div className="flex items-center gap-2 rounded-lg border bg-background px-3 py-2">
                 <Search className="h-4 w-4 text-muted-foreground" />
@@ -310,26 +363,24 @@ const DataViewerContent = () => {
                 <option value="descending">Descending</option>
               </select>
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* Data Table */}
-      <div className="flex-1 overflow-auto">
-        <div className="px-6 py-4">
-          {rows.length === 0 ? (
-            <div className="flex items-center justify-center py-12">
-              {isLoading ? (
-                <Loader className="h-6 w-6 animate-spin text-muted-foreground" />
-              ) : (
-                <p className="text-sm text-muted-foreground">No data yet. Start a pipeline to see results.</p>
-              )}
             </div>
-          ) : (
-            <div>
-              <h3 className="mb-2 font-display text-xs font-semibold text-foreground uppercase tracking-wide">
-                Data Records
-              </h3>
+            </div>
+            )}
+
+            {/* Data Table */}
+            {rows.length === 0 ? (
+              <div className="flex items-center justify-center py-12">
+                {isLoading ? (
+                  <Loader className="h-6 w-6 animate-spin text-muted-foreground" />
+                ) : (
+                  <p className="text-sm text-muted-foreground">No data yet. Start a pipeline to see results.</p>
+                )}
+              </div>
+            ) : (
+              <div>
+                <h3 className="mb-2 font-display text-xs font-semibold text-foreground uppercase tracking-wide">
+                  Data Records
+                </h3>
               <p className="mb-3 font-body text-xs text-muted-foreground">
                 Showing {startIdx + 1} to {Math.min(startIdx + rowsPerPage, sortedRows.length)} of {sortedRows.length} records
               </p>
@@ -369,11 +420,11 @@ const DataViewerContent = () => {
 
               {/* Pagination */}
               {totalPages > 1 && (
-                <div className="mt-4 flex items-center justify-between">
+                <div className="mt-4 flex flex-col items-center justify-center gap-3">
                   <span className="text-xs text-muted-foreground">
                     Page {currentPage} of {totalPages}
                   </span>
-                  <div className="flex gap-1">
+                  <div className="flex flex-wrap justify-center gap-1">
                     <button
                       onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
                       disabled={currentPage === 1}
@@ -405,9 +456,21 @@ const DataViewerContent = () => {
                 </div>
               )}
             </div>
-          )}
+            )}
+          </div>
         </div>
       </div>
+
+      {/* Column Selector Modal */}
+      {showColumnSelector && (
+        <ColumnSelector
+          columns={columns}
+          selectedColumns={selectedColumns}
+          onSelectionChange={setSelectedColumns}
+          onClose={() => setShowColumnSelector(false)}
+          onAnalyze={handleAnalyzeColumns}
+        />
+      )}
     </div>
   );
 };

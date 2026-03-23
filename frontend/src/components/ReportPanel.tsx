@@ -65,14 +65,15 @@ const ReportPanel = () => {
   return (
     <div className="flex h-full flex-col bg-background">
       <div className="flex-1 overflow-auto">
-        <div className="px-6 py-4">
+        <div className="px-4 sm:px-6 lg:px-8 py-4">
+          <div className="mx-auto max-w-7xl">
           {isLoading || !reportContent ? (
             <div className="flex h-full items-center justify-center py-16">
               <div className="text-center">
                 {isLoading ? (
                   <>
                     <Loader className="h-8 w-8 animate-spin text-muted-foreground mx-auto mb-3" />
-                    <p className="text-sm text-muted-foreground">Generating validation report...</p>
+                    <p className="text-sm text-muted-foreground">Generating analysis report...</p>
                   </>
                 ) : (
                   <p className="text-sm text-muted-foreground">
@@ -89,8 +90,8 @@ const ReportPanel = () => {
                 <div className="mb-6 flex items-start gap-3 rounded-lg border border-success/30 bg-success/5 p-4">
                   <BadgeCheck className="h-5 w-5 text-success mt-0.5 flex-shrink-0" />
                   <div className="flex-1">
-                    <p className="font-display text-sm font-semibold text-foreground">Validation Complete</p>
-                    <p className="font-body text-xs text-muted-foreground mt-1">All validation checks passed successfully</p>
+                    <p className="font-display text-sm font-semibold text-foreground">Analysis Complete</p>
+                    <p className="font-body text-xs text-muted-foreground mt-1">All processing steps completed successfully</p>
                   </div>
                 </div>
               )}
@@ -113,6 +114,15 @@ const ReportPanel = () => {
                       ul: ({ node, ...props }) => <ul className="list-disc list-inside space-y-1 mb-3 text-sm" {...props} />,
                       ol: ({ node, ...props }) => <ol className="list-decimal list-inside space-y-1 mb-3 text-sm" {...props} />,
                       li: ({ node, ...props }) => <li className="text-sm text-foreground" {...props} />,
+                      strong: ({ node, children, ...props }) => {
+                        const text = String(children).toLowerCase();
+                        const isClean = text.includes('clean') || text.includes('after');
+                        return isClean ? (
+                          <strong className="font-semibold text-success" {...props}>{children}</strong>
+                        ) : (
+                          <strong className="font-semibold text-foreground" {...props}>{children}</strong>
+                        );
+                      },
                       code: ({ node, inline, ...props }) =>
                         inline ? (
                           <code className="bg-muted px-2 py-1 rounded text-xs font-mono text-primary" {...props} />
@@ -124,12 +134,20 @@ const ReportPanel = () => {
                           <table className="w-full text-sm" {...props} />
                         </div>
                       ),
-                      td: ({ node, ...props }) => (
-                        <td className="border px-3 py-2 text-xs text-foreground" {...props} />
-                      ),
-                      th: ({ node, ...props }) => (
-                        <th className="border bg-muted px-3 py-2 text-xs font-semibold text-foreground text-left" {...props} />
-                      ),
+                      td: ({ node, children, ...props }) => {
+                        const text = String(children).toLowerCase();
+                        const isClean = text.includes('clean') || text.includes('after');
+                        return (
+                          <td className={`border px-3 py-2 text-xs ${isClean ? 'text-success font-semibold' : 'text-foreground'}`} {...props}>{children}</td>
+                        );
+                      },
+                      th: ({ node, children, ...props }) => {
+                        const text = String(children).toLowerCase();
+                        const isClean = text.includes('clean') || text.includes('after');
+                        return (
+                          <th className={`border bg-muted px-3 py-2 text-xs font-semibold text-left ${isClean ? 'text-success' : 'text-foreground'}`} {...props}>{children}</th>
+                        );
+                      },
                       blockquote: ({ node, ...props }) => (
                         <blockquote className="border-l-4 border-primary pl-4 text-sm italic my-3 text-muted-foreground" {...props} />
                       ),
@@ -142,12 +160,13 @@ const ReportPanel = () => {
               </div>
             </>
           )}
+          </div>
         </div>
       </div>
 
       {/* Footer Actions */}
       {reportContent && !isLoading && (
-        <div className="border-t bg-card/50 px-6 py-3 flex items-center justify-between">
+        <div className="border-t bg-card/50 px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between">
           <div className="flex items-center gap-2">
             {isComplete && (
               <span className="flex items-center gap-1 text-xs">

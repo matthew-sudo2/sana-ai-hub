@@ -11,8 +11,8 @@ interface PhaseInfo {
 const phaseMap: Record<string, PhaseInfo> = {
   scout: {
     id: "scout",
-    name: "Scouting",
-    description: "Acquiring & validating dataset",
+    name: "Dataset Processing",
+    description: "Loading & preparing dataset for processing",
     icon: <Globe className="h-5 w-5" />,
   },
   labeler: {
@@ -35,8 +35,8 @@ const phaseMap: Record<string, PhaseInfo> = {
   },
   validator: {
     id: "validator",
-    name: "Validation",
-    description: "Sanity checks & confidence scoring",
+    name: "Verification",
+    description: "Quality assurance & confidence scoring",
     icon: <ShieldCheck className="h-5 w-5" />,
   },
   pending: {
@@ -61,7 +61,7 @@ const PhaseStatus = () => {
   const isCompleted = phase === "complete";
 
   return (
-    <div className="px-6 py-4 bg-gradient-to-r from-primary/5 to-primary/10 border-b rounded-lg mx-4 my-2">
+    <div className="py-4 bg-gradient-to-r from-primary/5 to-primary/10 border-b rounded-lg">
       <div className="flex items-start justify-between">
         <div className="flex items-start gap-3 flex-1">
           <div

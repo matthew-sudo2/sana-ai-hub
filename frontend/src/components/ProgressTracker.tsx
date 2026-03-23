@@ -2,11 +2,11 @@ import { Globe, Tags, LineChart, BarChart3, ShieldCheck, Loader } from "lucide-r
 import { usePipeline } from "@/context/PipelineContext";
 
 const steps = [
-  { icon: Globe, label: "Scouting", sublabel: "Data Acquisition", phaseId: "scout" },
+  { icon: Globe, label: "Dataset Processing", sublabel: "Loading & Preparation", phaseId: "scout" },
   { icon: Tags, label: "Preparation", sublabel: "Cleaning & Normalization", phaseId: "labeler" },
   { icon: LineChart, label: "Analysis", sublabel: "Patterns & Correlations", phaseId: "analyst" },
-  { icon: BarChart3, label: "Visualization", sublabel: "Chart Selection", phaseId: "artist" },
-  { icon: ShieldCheck, label: "Validation", sublabel: "Sanity & Confidence", phaseId: "validator" },
+  { icon: BarChart3, label: "Visualization", sublabel: "Chart & Visual Selection", phaseId: "artist" },
+  { icon: ShieldCheck, label: "Verification", sublabel: "Quality & Confidence", phaseId: "validator" },
 ];
 
 const getPhaseStatus = (phaseId: string, currentPhase: string, isRunning: boolean) => {
@@ -29,7 +29,7 @@ const ProgressTracker = () => {
   const { phase, isRunning } = usePipeline();
 
   return (
-    <div className="flex items-center justify-center gap-0 px-8 py-5">
+    <div className="flex items-center justify-center gap-0 py-5">
       {steps.map((step, i) => {
         const status = getPhaseStatus(step.phaseId, phase, isRunning);
         const isCurrentPhase = step.phaseId === phase && isRunning;

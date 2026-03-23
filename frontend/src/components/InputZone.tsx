@@ -92,7 +92,7 @@ const InputZone = () => {
 
 
   return (
-    <div className="px-6 pb-4 space-y-3">
+    <div className="pb-4 space-y-3">
       {/* File Upload Section */}
       <div>
         <input

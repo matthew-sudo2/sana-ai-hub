@@ -1,4 +1,4 @@
-import { ChevronLeft, ChevronRight, Download, Loader, Home, Search, ArrowUp, ArrowDown } from "lucide-react";
+import { ChevronLeft, ChevronRight, Download, Loader, Home, Search, ArrowUp, ArrowDown, ArrowLeft } from "lucide-react";
 import { useEffect, useState, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { usePipeline } from "@/context/PipelineContext";
@@ -210,9 +210,18 @@ const DataViewer = () => {
     <div className="flex min-h-screen flex-col bg-background">
       {/* Header */}
       <header className="flex items-center justify-between border-b px-6 py-4">
-        <div>
-          <h1 className="font-display text-2xl font-bold text-foreground">Data Viewer</h1>
-          <p className="font-body text-sm text-muted-foreground">Cleaned & processed dataset with quality metrics</p>
+        <div className="flex items-center gap-4">
+          <button
+            onClick={() => navigate("/")}
+            className="flex items-center justify-center h-9 w-9 rounded-md text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+            title="Back to Home"
+          >
+            <ArrowLeft className="h-5 w-5" />
+          </button>
+          <div>
+            <h1 className="font-display text-2xl font-bold text-foreground">Data Viewer</h1>
+            <p className="font-body text-sm text-muted-foreground">Cleaned & processed dataset with quality metrics</p>
+          </div>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -222,13 +231,6 @@ const DataViewer = () => {
           >
             <Download className="h-4 w-4" />
             Export CSV
-          </button>
-          <button
-            onClick={() => navigate("/")}
-            className="flex h-10 items-center gap-2 rounded-md border px-4 text-sm text-muted-foreground transition-colors hover:bg-muted"
-          >
-            <Home className="h-4 w-4" />
-            Dashboard
           </button>
         </div>
       </header>
