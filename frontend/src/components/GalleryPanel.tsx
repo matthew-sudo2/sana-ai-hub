@@ -126,7 +126,7 @@ function StatPill({ label, value, highlight }: StatPillProps) {
 }
 
 // ---------------------------------------------------------------------------
-// Sub-component: Fullscreen viewer with explanation footer
+// Sub-component: Fullscreen viewer with explanation footer (collapsed by default)
 // ---------------------------------------------------------------------------
 
 interface ViewerProps {
@@ -144,6 +144,9 @@ function FullscreenViewer({
   onClose,
   onDownload,
 }: ViewerProps) {
+  // Explanation is COLLAPSED by default — user must toggle to view
+  const [explanationOpen, setExplanationOpen] = useState(false);
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
@@ -191,70 +194,101 @@ function FullscreenViewer({
           />
         </div>
 
-        {/* Explanation footer */}
-        {explanation && (
-          <div className="border-t bg-card px-6 py-4">
-            <div className="flex items-start gap-2">
-              <Sparkles className="mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-primary" />
-              <p className="font-body text-sm leading-relaxed text-foreground/80">
-                {explanation.explanation}
-              </p>
-            </div>
+        {/* Download button below image */}
+        <div className="flex items-center justify-end gap-2 bg-muted/10 px-6 py-2">
+          <button
+            onClick={() => onDownload(filename)}
+            className="flex h-8 items-center gap-2 rounded-md border px-3 text-xs text-muted-foreground hover:bg-muted transition-colors"
+          >
+            <Download className="h-3.5 w-3.5" />
+            Download
+          </button>
+        </div>
 
-            {/* Stats row */}
-            {explanation.stats && Object.keys(explanation.stats).length > 0 && (
-              <div className="mt-3 flex flex-wrap gap-2">
-                {explanation.stats.mean != null && (
-                  <StatPill label="mean" value={explanation.stats.mean} />
+        {/* Graph Interpretation — collapsed by default */}
+        {explanation && (
+          <div className="border-t bg-white">
+            {/* Toggle button */}
+            <button
+              onClick={() => setExplanationOpen((v) => !v)}
+              className="flex w-full items-center justify-between px-6 py-3 text-left hover:bg-gray-50 transition-colors"
+            >
+              <span
+                style={{
+                  fontFamily: "'Poppins', sans-serif",
+                  fontWeight: 600,
+                  fontSize: "14px",
+                  color: "#10b981",
+                }}
+              >
+                Graph Interpretation
+              </span>
+              {explanationOpen ? (
+                <ChevronUp className="h-4 w-4 text-gray-400" />
+              ) : (
+                <ChevronDown className="h-4 w-4 text-gray-400" />
+              )}
+            </button>
+
+            {/* Expanded content */}
+            {explanationOpen && (
+              <div className="border-t px-6 py-4 bg-white">
+                <p
+                  style={{
+                    fontFamily: "'Poppins', sans-serif",
+                    fontWeight: 500,
+                    fontSize: "14px",
+                    color: "#111827",
+                    lineHeight: "1.6",
+                  }}
+                >
+                  {explanation.explanation}
+                </p>
+
+                {/* Stats row */}
+                {explanation.stats && Object.keys(explanation.stats).length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {explanation.stats.mean != null && (
+                      <StatPill label="mean" value={explanation.stats.mean} />
+                    )}
+                    {explanation.stats.median != null && (
+                      <StatPill label="median" value={explanation.stats.median} />
+                    )}
+                    {explanation.stats.std != null && (
+                      <StatPill label="std" value={explanation.stats.std} />
+                    )}
+                    {explanation.stats.min != null && (
+                      <StatPill label="min" value={explanation.stats.min} />
+                    )}
+                    {explanation.stats.max != null && (
+                      <StatPill label="max" value={explanation.stats.max} />
+                    )}
+                    {(explanation.stats.outlier_count ?? 0) > 0 && (
+                      <StatPill
+                        label="outliers"
+                        value={explanation.stats.outlier_count!}
+                        highlight
+                      />
+                    )}
+                    {explanation.stats.trend &&
+                      explanation.stats.trend !== "flat" && (
+                        <span className="inline-flex items-center gap-1 rounded-full border border-success/30 bg-success/10 px-2 py-0.5 font-mono text-[9px] text-success">
+                          <TrendingUp className="h-2.5 w-2.5" />
+                          {explanation.stats.trend}
+                        </span>
+                      )}
+                  </div>
                 )}
-                {explanation.stats.median != null && (
-                  <StatPill label="median" value={explanation.stats.median} />
-                )}
-                {explanation.stats.std != null && (
-                  <StatPill label="std" value={explanation.stats.std} />
-                )}
-                {explanation.stats.min != null && (
-                  <StatPill label="min" value={explanation.stats.min} />
-                )}
-                {explanation.stats.max != null && (
-                  <StatPill label="max" value={explanation.stats.max} />
-                )}
-                {(explanation.stats.outlier_count ?? 0) > 0 && (
-                  <StatPill
-                    label="outliers"
-                    value={explanation.stats.outlier_count!}
-                    highlight
-                  />
-                )}
-                {explanation.stats.trend &&
-                  explanation.stats.trend !== "flat" && (
-                    <span className="inline-flex items-center gap-1 rounded-full border border-success/30 bg-success/10 px-2 py-0.5 font-mono text-[9px] text-success">
-                      <TrendingUp className="h-2.5 w-2.5" />
-                      {explanation.stats.trend}
-                    </span>
-                  )}
               </div>
             )}
           </div>
         )}
-
-        {/* Action bar */}
-        <div className="flex items-center justify-end gap-2 border-t bg-muted/20 px-6 py-3">
-          <button
-            onClick={() => onDownload(filename)}
-            className="flex h-9 items-center gap-2 rounded-md border px-4 text-sm text-muted-foreground hover:bg-muted transition-colors"
-          >
-            <Download className="h-4 w-4" />
-            Download
-          </button>
-          <button
-            onClick={onClose}
-            className="flex h-9 items-center gap-2 rounded-md border px-4 text-sm text-muted-foreground hover:bg-muted transition-colors"
-          >
-            Close
-          </button>
-        </div>
       </div>
+
+      {/* Poppins font import */}
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@500;600&display=swap');
+      `}</style>
     </div>
   );
 }
@@ -323,19 +357,16 @@ const GalleryPanel = () => {
   const [displayImages, setDisplayImages] = useState<string[]>(images);
   const [viewingImage, setViewingImage] = useState<string | null>(null);
 
-  // Explanation data keyed by filename
   const [explanationsMap, setExplanationsMap] = useState<
     Record<string, ChartExplanation>
   >({});
   const [keyInsights, setKeyInsights] = useState<string[]>([]);
   const [explanationsLoading, setExplanationsLoading] = useState(false);
 
-  // Sync images from pipeline context
   useEffect(() => {
     setDisplayImages(images);
   }, [images]);
 
-  // Fetch explanations once the artist/complete phase is reached
   const loadExplanations = useCallback(async () => {
     if (!runId) return;
     setExplanationsLoading(true);
@@ -350,7 +381,7 @@ const GalleryPanel = () => {
         setKeyInsights(data.key_insights ?? []);
       }
     } catch {
-      // Silently ignore — explanations are supplementary
+      // Silently ignore
     } finally {
       setExplanationsLoading(false);
     }
@@ -358,7 +389,6 @@ const GalleryPanel = () => {
 
   useEffect(() => {
     if (!runId) return;
-    // Load as soon as artist or later phase is active
     if (
       phase === "artist" ||
       phase === "validator" ||
@@ -389,7 +419,6 @@ const GalleryPanel = () => {
     try {
       const response = await generateCustomChart(runId, instruction.trim());
       await refreshImages();
-      // Reload explanations to pick up the new custom chart entry
       await loadExplanations();
       setInstruction("");
       toast({
@@ -415,7 +444,6 @@ const GalleryPanel = () => {
       <div className="flex-1 overflow-auto">
         <div className="px-4 sm:px-6 lg:px-8 py-4">
           <div className="mx-auto max-w-7xl">
-            {/* Dataset key insights */}
             {keyInsights.length > 0 && (
               <KeyInsightsBanner insights={keyInsights} />
             )}
@@ -448,8 +476,7 @@ const GalleryPanel = () => {
                 </button>
               </div>
               <p className="font-body text-xs text-muted-foreground">
-                💡 Tip: Use column names, chart type (bar, scatter, line), and
-                conditions
+                💡 Tip: Use column names, chart type (bar, scatter, line), and conditions
               </p>
             </div>
 
@@ -492,8 +519,7 @@ const GalleryPanel = () => {
                     </div>
                   ) : (
                     <p className="text-sm text-muted-foreground">
-                      No visualizations yet. Complete the Artist phase to see
-                      charts.
+                      No visualizations yet. Complete the Artist phase to see charts.
                     </p>
                   )}
                 </div>
@@ -506,7 +532,6 @@ const GalleryPanel = () => {
                         key={filename}
                         className="group relative flex flex-col rounded-lg border bg-card overflow-hidden shadow-sm transition-all hover:border-primary/50 hover:shadow-md"
                       >
-                        {/* Chart type badge */}
                         {exp && (
                           <div className="absolute left-2 top-2 z-10 flex items-center gap-1 rounded-full border border-border/60 bg-background/90 px-2 py-0.5 backdrop-blur-sm">
                             <span className="text-[10px]">
@@ -527,7 +552,6 @@ const GalleryPanel = () => {
                                 alt={exp?.title ?? filename}
                                 className="h-full w-full object-cover transition-transform group-hover:scale-105"
                               />
-                              {/* Overlay with Actions */}
                               <div className="absolute inset-0 flex items-center justify-center gap-3 bg-black/20 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
                                 <button
                                   onClick={() => setViewingImage(filename)}

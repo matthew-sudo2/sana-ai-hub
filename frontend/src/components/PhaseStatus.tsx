@@ -62,7 +62,7 @@ const PhaseStatus = () => {
 
   return (
     <div className="py-4 bg-gradient-to-r from-primary/5 to-primary/10 border-b rounded-lg">
-      <div className="flex items-start justify-between">
+      <div className="flex items-start justify-between ml-3">
         <div className="flex items-start gap-3 flex-1">
           <div
             className={`mt-0.5 p-2.5 rounded-lg flex items-center justify-center ${

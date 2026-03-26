@@ -47,7 +47,7 @@ const Landing = () => {
   return (
     <div className="min-h-screen bg-background text-foreground">
       {/* Nav */}
-      <nav className="fixed inset-x-0 top-0 z-50 border-b bg-background/80 backdrop-blur-md">
+      <nav className="fixed inset-x-0 top-0 z-50 border-b bg-background/80 backdrop-blur-md shadow-[4px_0_7px_0_rgba(0,0,0,0.3)]">
         <div className="mx-auto flex h-14 max-w-6xl items-center justify-between px-6">
           <Link to="/" className="flex items-center gap-2 hover:opacity-80 transition-opacity">
             <img src={logo} alt="Sana All May Label" className="h-6 w-6" />
