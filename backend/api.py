@@ -873,6 +873,97 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
         return JSONResponse(status_code=500, content={"error": f"Unexpected error: {str(e)}"})
 
 
+@app.post("/runs/{run_id}/visualize-natural-language")
+async def visualize_natural_language(run_id: str, request: CustomChartRequest):
+    """
+    Generate visualization from natural language request using LLM intent parser.
+
+    Supports two modes:
+    1. VISUALIZATION MODE - User wants an actual chart
+       Request: {"instruction": "Show how prices changed over time"}
+       Response: {"mode": "visualization", "chart": {...}, "plot_spec": {...}}
+
+    2. GUIDANCE MODE - User asks for chart recommendations
+       Request: {"instruction": "How should I visualize my data?"}
+       Response: {"mode": "guidance", "guidance": {...}}
+
+    Uses the Artist Agent's natural language parser to understand intent,
+    then executes appropriate visualization based on PlotSpec.
+    """
+    try:
+        state = get_run(run_id)
+        if not state:
+            return JSONResponse(status_code=404, content={"error": f"Run {run_id} not found"})
+
+        csv_path = _resolve_cleaned_csv_path(state)
+        if not csv_path:
+            return JSONResponse(status_code=404, content={"error": "cleaned_data.csv not found"})
+
+        output_dir = _resolve_pipeline_output_dir(state)
+        if not output_dir:
+            return JSONResponse(status_code=404, content={"error": "No output directory found for run"})
+
+        prompt = (request.instruction or "").strip()
+        if not prompt:
+            return JSONResponse(status_code=400, content={"error": "instruction is required"})
+
+        # Load data
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": f"Failed to read CSV: {str(e)}"})
+
+        if df.empty:
+            return JSONResponse(status_code=400, content={"error": "cleaned_data.csv is empty"})
+
+        # Call the artist agent's natural language visualizer
+        from .agents.artist import generate_from_natural_language
+        
+        result = await generate_from_natural_language(
+            df=df,
+            user_prompt=prompt,
+            out_dir=output_dir,
+            model="llama3.2:3b",
+            ollama_host="http://127.0.0.1:11434",
+        )
+
+        # Handle different response modes
+        if result["mode"] == "visualization":
+            # Update viz_summary.json with the new chart
+            try:
+                viz_summary_path = output_dir / "viz_summary.json"
+                if viz_summary_path.exists():
+                    summary = _read_json_file(viz_summary_path)
+                else:
+                    summary = {
+                        "source": str(csv_path),
+                        "source_type": "csv",
+                        "num_rows": len(df),
+                        "num_columns": len(df.columns),
+                        "charts": [],
+                        "timestamp": dt.datetime.utcnow().isoformat(),
+                    }
+
+                # Add the new chart to the summary
+                if "chart" in result:
+                    summary["charts"].append(result["chart"])
+                    summary["timestamp"] = dt.datetime.utcnow().isoformat()
+                    viz_summary_path.write_text(
+                        json.dumps(summary, ensure_ascii=False, indent=2),
+                        encoding="utf-8"
+                    )
+            except Exception as e:
+                print(f"[WARNING] Failed to update viz_summary.json: {e}", flush=True)
+
+        return JSONResponse(result)
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Natural language visualization failed: {str(e)}"}
+        )
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""

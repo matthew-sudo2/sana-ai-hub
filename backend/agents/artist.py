@@ -876,6 +876,173 @@ def run_visualization(
 
 
 # ---------------------------------------------------------------------------
+# Natural Language Visualization Support
+# ---------------------------------------------------------------------------
+
+async def generate_from_natural_language(
+    df: pd.DataFrame,
+    user_prompt: str,
+    *,
+    out_dir: Path | None = None,
+    model: str = "llama3.2:3b",
+    ollama_host: str = "http://127.0.0.1:11434",
+) -> dict[str, Any]:
+    """
+    Generate visualization from natural language request.
+    
+    This function bridges natural language requests to the visualization pipeline:
+    1. Uses LLM intent parser to understand user request
+    2. Returns guidance if user asks "how to visualize"
+    3. Executes existing plotting functions if visualization mode is detected
+    4. Validates PlotSpec before execution
+    
+    Args:
+        df: DataFrame to visualize
+        user_prompt: Natural language request from user
+        out_dir: Where to save generated charts
+        model: Ollama model for intent parsing
+        ollama_host: Ollama endpoint URL
+        
+    Returns:
+        Dict with either:
+        - mode="visualization": chart PNG + metadata
+        - mode="guidance": educational explanation
+        - mode="unclear": error message
+    """
+    from backend.agents.artist_intent_parser import parse_visualization_intent
+    
+    _apply_theme()
+    out_dir = out_dir or Path.cwd()
+    _ensure_dir(out_dir)
+    
+    # Step 1: Parse natural language intent
+    print(f"[artist] Parsing intent from user prompt...", flush=True)
+    intent_result = await parse_visualization_intent(
+        user_prompt=user_prompt,
+        columns=list(df.columns),
+        model=model,
+        ollama_host=ollama_host,
+    )
+    
+    # Step 2: Handle different modes
+    if intent_result.mode == "guidance":
+        print("[artist] User requested educational guidance (not a chart).", flush=True)
+        return {
+            "mode": "guidance",
+            "guidance": intent_result.guidance.model_dump() if intent_result.guidance else {},
+        }
+    
+    elif intent_result.mode == "unclear":
+        print(f"[artist] Could not parse intent: {intent_result.error}", flush=True)
+        return {
+            "mode": "unclear",
+            "error": intent_result.error or "Unable to understand visualization request.",
+        }
+    
+    # Step 3: Visualization mode — execute the plot
+    if not intent_result.plot_spec:
+        return {
+            "mode": "unclear",
+            "error": "No valid plot specification generated.",
+        }
+    
+    spec = intent_result.plot_spec
+    
+    # Check confidence — low confidence requests ask for clarification
+    if spec.confidence == "low":
+        return {
+            "mode": "unclear",
+            "error": f"Request interpretation uncertain: {spec.reasoning}",
+            "alternative": "Please provide more specific column names or chart type preferences.",
+        }
+    
+    # Step 4: Execute the appropriate built-in plotting function
+    print(f"[artist] Executing {spec.chart_type} chart...", flush=True)
+    
+    try:
+        chart_record = _execute_natural_language_plot(
+            df=df,
+            plot_spec=spec,
+            out_dir=out_dir,
+            outlier_rows=[],  # No outlier analysis in natural language mode
+        )
+        
+        if chart_record is None:
+            return {
+                "mode": "unclear",
+                "error": f"Failed to generate {spec.chart_type} chart.",
+            }
+        
+        return {
+            "mode": "visualization",
+            "chart": chart_record.model_dump(),
+            "plot_spec": spec.model_dump(),
+        }
+    
+    except Exception as e:
+        print(f"[artist] Error executing natural language plot: {e}", flush=True)
+        return {
+            "mode": "unclear",
+            "error": f"Chart generation failed: {str(e)}",
+        }
+
+
+def _execute_natural_language_plot(
+    df: pd.DataFrame,
+    plot_spec,  # PlotSpec from intent parser
+    out_dir: Path,
+    outlier_rows: list[int],
+) -> ChartRecord | None:
+    """Execute plotting based on Natural Language PlotSpec."""
+    chart_type = plot_spec.chart_type.lower()
+    x_axis = plot_spec.x_axis
+    y_axis = plot_spec.y_axis
+    title = plot_spec.title or f"{chart_type.title()} Chart"
+    
+    # Apply filters if specified
+    filtered_df = df.copy()
+    if plot_spec.filters:
+        for col, val in plot_spec.filters.items():
+            if col in filtered_df.columns:
+                filtered_df = filtered_df[filtered_df[col] == val]
+    
+    out_filename = f"nl_{chart_type}_{_safe_slug(x_axis or 'chart')}.png"
+    out_path = out_dir / out_filename
+    
+    try:
+        if chart_type == "scatter" and x_axis and y_axis:
+            return _plot_scatter(filtered_df, x_axis, y_axis, out_path, outlier_rows)
+        
+        elif chart_type == "line" and y_axis:
+            return _plot_line(filtered_df, y_axis, out_path)
+        
+        elif chart_type == "bar" and y_axis:
+            return _plot_bar(filtered_df, y_axis, out_path)
+        
+        elif chart_type == "histogram" and (x_axis or y_axis):
+            col = x_axis or y_axis
+            return _plot_histogram(filtered_df, col, out_path, outlier_rows)
+        
+        elif chart_type == "pie" and y_axis:
+            return _plot_pie(filtered_df, y_axis, out_path)
+        
+        elif chart_type == "box" and y_axis:
+            cols = [y_axis] if y_axis else []
+            return _plot_box(filtered_df, cols, out_path)
+        
+        elif chart_type == "heatmap":
+            return _plot_heatmap(filtered_df, out_path)
+        
+        else:
+            print(f"[artist] Unsupported chart type: {chart_type}", flush=True)
+            return None
+    
+    except Exception as e:
+        print(f"[artist] Failed to create {chart_type} chart: {e}", flush=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -934,3 +1101,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except KeyboardInterrupt:
         raise SystemExit(130)
+    
