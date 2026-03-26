@@ -31,6 +31,12 @@ _ENV_PATH = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=_ENV_PATH)
 
 from .graph import create_run, get_run, execute_run, PipelineState
+from .agents.analyst import (
+    _generate_visualization_explanation,
+    _load_cached_explanation,
+    _save_cached_explanation,
+    VisualizationExplanation,
+)
 
 
 app = fastapi.FastAPI(
@@ -552,6 +558,59 @@ async def get_descriptive_stats(run_id: str):
     )
 
 
+# ============================================================================
+# Async Explanation Generation (non-blocking)
+# ============================================================================
+
+async def _generate_explanation_async(
+    chart_type: str,
+    title: str,
+    x: str,
+    y: str,
+    dataset: str,
+    output_dir: Path,
+) -> VisualizationExplanation | None:
+    """
+    Generate visualization explanation in background without blocking.
+    
+    Runs in executor to avoid blocking the event loop.
+    Includes caching to avoid redundant LLM calls.
+    """
+    try:
+        import os
+        
+        # Check cache first
+        cache_dir = output_dir / ".explanation_cache"
+        cached = _load_cached_explanation(cache_dir, chart_type, x, y, dataset)
+        if cached:
+            return cached
+        
+        # Generate new explanation via LLM
+        ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+        model = os.getenv("OLLAMA_PHASE3_MODEL", "llama3.2:3b")
+        template_path = Path(__file__).parent / "prompts" / "analyst_prompt.txt"
+        
+        explanation = _generate_visualization_explanation(
+            chart_type=chart_type,
+            title=title,
+            x=x,
+            y=y,
+            dataset=dataset,
+            model=model,
+            ollama_host=ollama_host,
+            template_path=template_path,
+        )
+        
+        # Cache the result if successful
+        if explanation:
+            _save_cached_explanation(cache_dir, explanation, chart_type, x, y, dataset)
+        
+        return explanation
+    except Exception as e:
+        print(f"[api] Explanation generation failed: {e}", flush=True)
+        return None
+
+
 @app.post("/runs/{run_id}/charts/custom")
 async def create_custom_chart(run_id: str, request: CustomChartRequest):
     """
@@ -775,6 +834,19 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
             # Log but don't fail - chart was created successfully
             print(f"[WARNING] Failed to update viz_summary.json: {e}", flush=True)
 
+        # Generate explanation asynchronously without blocking chart response
+        dataset_name = Path(csv_path).stem if csv_path else "dataset"
+        asyncio.create_task(
+            _generate_explanation_async(
+                chart_type=chart_type,
+                title=title,
+                x=columns_used[0] if len(columns_used) > 0 else "",
+                y=columns_used[1] if len(columns_used) > 1 else columns_used[0] if columns_used else "",
+                dataset=dataset_name,
+                output_dir=output_dir,
+            )
+        )
+
         return JSONResponse(
             {
                 "run_id": run_id,
@@ -783,11 +855,80 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
                 "columns_used": columns_used,
                 "title": title,
                 "instruction": instruction,
+                "explanation": None,  # Explanation will be generated asynchronously
             }
         )
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Unexpected error: {str(e)}"})
+
+
+@app.get("/runs/{run_id}/charts/{chart_type}/explanation")
+async def get_chart_explanation(
+    run_id: str,
+    chart_type: str,
+    x: str = "",
+    y: str = "",
+    dataset: str = "dataset",
+):
+    """
+    Fetch cached explanation for a visualization.
+    
+    Query parameters:
+    - x: x-axis column name (or empty for single-column charts)
+    - y: y-axis column name
+    - dataset: dataset name/identifier
+    
+    Returns:
+    {
+        "explanation": {
+            "summary": "...",
+            "insight": "...",
+            "interpretation": "...",
+            "suggestion": "..."
+        }
+    }
+    
+    Returns 202 (Accepted) if explanation is still being generated.
+    Returns 404 if chart or explanation not found.
+    """
+    try:
+        state = get_run(run_id)
+        if not state:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Run {run_id} not found"},
+            )
+        
+        output_dir = _resolve_pipeline_output_dir(state)
+        if not output_dir:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "No output directory found for run"},
+            )
+        
+        # Load cached explanation
+        cache_dir = output_dir / ".explanation_cache"
+        explanation = _load_cached_explanation(cache_dir, chart_type, x, y, dataset)
+        
+        if explanation:
+            return JSONResponse(
+                {
+                    "explanation": explanation.model_dump(),
+                }
+            )
+        else:
+            # Explanation not yet available (still generating or not requested)
+            return JSONResponse(
+                status_code=202,
+                content={"message": "Explanation is being generated. Please try again in a moment."},
+            )
+    
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to fetch explanation: {str(e)}"},
+        )
 
 
 @app.get("/health")
@@ -813,6 +954,7 @@ async def root():
                 "GET /runs/{run_id}/validation": "Get validation_result.json",
                 "GET /runs/{run_id}/stats": "Get descriptive stats for cleaned CSV",
                 "POST /runs/{run_id}/charts/custom": "Generate custom chart from instruction",
+                "GET /runs/{run_id}/charts/{chart_type}/explanation": "Get AI-generated explanation for chart (query: x, y, dataset)",
                 "GET /health": "Health check",
             },
         }
