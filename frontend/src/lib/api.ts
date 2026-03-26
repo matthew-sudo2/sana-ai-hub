@@ -42,12 +42,20 @@ export interface StatsResponse {
   stats: ColumnStats[];
 }
 
+export interface ChartExplanation {
+  summary: string;        // One-sentence description of what the chart shows
+  insight: string;        // Key finding or pattern in the data
+  interpretation: string; // Non-technical meaning of the pattern
+  suggestion: string;     // Recommended action based on the visualization
+}
+
 export interface CustomChartResponse {
   run_id: string;
   filename: string;
   chart_type: string;
   columns_used: string[];
   instruction: string;
+  explanation?: ChartExplanation; // AI-generated explanation of the chart
 }
 
 export class APIError extends Error {

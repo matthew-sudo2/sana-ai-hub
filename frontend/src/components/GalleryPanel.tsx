@@ -1,7 +1,7 @@
 import { Download, Loader, SendHorizontal, Eye, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { usePipeline } from "@/context/PipelineContext";
-import { fetchImagesList, generateCustomChart, getImageURL } from "@/lib/api";
+  import { fetchImagesList, generateCustomChart, getImageURL } from "@/lib/api";
 import { useToast } from "@/hooks/use-toast";
 
 const GalleryPanel = () => {

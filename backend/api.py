@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,11 @@ _ENV_PATH = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=_ENV_PATH)
 
 from .graph import create_run, get_run, execute_run, PipelineState
+from .agents.analyst import (
+    VisualizationMetadata,
+    VisualizationExplanation,
+    _generate_explanation_sync,
+)
 
 
 app = fastapi.FastAPI(
@@ -74,6 +80,24 @@ class RunResponse(BaseModel):
 
 class CustomChartRequest(BaseModel):
     instruction: str
+
+
+class ChartExplanationRequest(BaseModel):
+    """Request for generating AI explanation of a visualization."""
+    chart_type: str          # e.g. "histogram", "scatter", "bar", "line"
+    x: str | None = None     # x-axis column or description
+    y: str | None = None     # y-axis column or description
+    dataset: str = ""        # dataset name or description
+    correlation: float | None = None  # if applicable
+
+
+class ChartExplanationResponse(BaseModel):
+    """Response containing AI-generated visualization explanation."""
+    summary: str              # One sentence describing the chart
+    insight: str              # Key finding or pattern
+    interpretation: str       # What does it mean? (non-technical)
+    suggestion: str           # Recommended action
+    cached: bool = False      # Whether this came from cache
 
 
 # ============================================================================
@@ -246,11 +270,32 @@ async def download_csv(run_id: str):
 
 
 @app.get("/runs/{run_id}/images")
-async def list_images(run_id: str):
+async def list_images(run_id: str, include_explanations: bool = False):
     """
     List all PNG images from Phase 3 output.
     
-    Returns: {images: [filename1.png, filename2.png, ...]}
+    Query params:
+    - include_explanations: if true, also generate AI explanations for each chart
+    
+    Returns: 
+    - Without explanations: {images: [filename1.png, filename2.png, ...], count: N}
+    - With explanations: {
+        visualizations: [
+          {
+            filename: "...",
+            title: "...",
+            chart_type: "...",
+            explanation: {
+              summary: "...",
+              insight: "...",
+              interpretation: "...",
+              suggestion: "..."
+            }
+          },
+          ...
+        ],
+        count: N
+      }
     """
     state = get_run(run_id)
     if not state:
@@ -268,12 +313,92 @@ async def list_images(run_id: str):
     output_dir = Path(state["artist_output_dir"])
     pngs = sorted([f.name for f in output_dir.glob("*.png")])
     
+    if not include_explanations:
+        # Standard response: just list filenames
+        return JSONResponse(
+            {
+                "images": pngs,
+                "count": len(pngs),
+            }
+        )
+    
+    # Enhanced response with explanations
+    visualizations = []
+    
+    # Try to load viz_summary.json for chart metadata
+    viz_summary_path = output_dir / "viz_summary.json"
+    chart_metadata = {}
+    if viz_summary_path.exists():
+        try:
+            viz_data = _read_json_file(viz_summary_path)
+            # Index by PNG filename for quick lookup
+            if "charts" in viz_data:
+                for chart in viz_data["charts"]:
+                    if "png_path" in chart:
+                        # Extract filename from path
+                        png_filename = Path(chart["png_path"]).name
+                        chart_metadata[png_filename] = chart
+        except Exception as e:
+            print(f"[api] Failed to load viz_summary.json: {e}", flush=True)
+    
+    # Generate visualization cards with explanations
+    for png_filename in pngs:
+        chart_info = chart_metadata.get(png_filename, {})
+        chart_type = chart_info.get("chart_type", "unknown")
+        columns_used = chart_info.get("columns_used", [])
+        title = chart_info.get("title", f"Chart: {png_filename}")
+        
+        # Create metadata for explanation generation
+        x_col = columns_used[0] if len(columns_used) > 0 else None
+        y_col = columns_used[1] if len(columns_used) > 1 else None
+        
+        metadata = VisualizationMetadata(
+            chart_type=chart_type,
+            x=x_col,
+            y=y_col,
+            dataset=f"Run {run_id}",
+            correlation=None,
+        )
+        
+        # Generate explanation
+        try:
+            model = os.getenv("OLLAMA_PHASE3_MODEL", "llama3.2:3b")
+            ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+            explanation = _generate_explanation_sync(
+                metadata=metadata,
+                model=model,
+                host=ollama_host,
+            )
+            explanation_data = {
+                "summary": explanation.summary,
+                "insight": explanation.insight,
+                "interpretation": explanation.interpretation,
+                "suggestion": explanation.suggestion,
+            }
+        except Exception as e:
+            print(f"[api] Failed to generate explanation for {png_filename}: {e}", flush=True)
+            explanation_data = {
+                "summary": f"Chart visualization",
+                "insight": "Explanation generation unavailable",
+                "interpretation": "Please review the chart manually",
+                "suggestion": "Analyze the data and visualization directly",
+            }
+        
+        visualizations.append({
+            "filename": png_filename,
+            "title": title,
+            "chart_type": chart_type,
+            "columns_used": columns_used,
+            "explanation": explanation_data,
+        })
+    
     return JSONResponse(
         {
-            "images": pngs,
-            "count": len(pngs),
+            "visualizations": visualizations,
+            "count": len(visualizations),
         }
     )
+
 
 
 @app.get("/runs/{run_id}/images/{filename}", response_model=None)
@@ -775,6 +900,43 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
             # Log but don't fail - chart was created successfully
             print(f"[WARNING] Failed to update viz_summary.json: {e}", flush=True)
 
+        # Generate AI explanation for the chart
+        explanation_data = None
+        try:
+            x_col = columns_used[0] if len(columns_used) > 0 else None
+            y_col = columns_used[1] if len(columns_used) > 1 else None
+            
+            metadata = VisualizationMetadata(
+                chart_type=chart_type,
+                x=x_col,
+                y=y_col,
+                dataset=f"Run {run_id}",
+                correlation=None,
+            )
+            
+            model = os.getenv("OLLAMA_PHASE3_MODEL", "llama3.2:3b")
+            ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+            explanation = _generate_explanation_sync(
+                metadata=metadata,
+                model=model,
+                host=ollama_host,
+            )
+            explanation_data = {
+                "summary": explanation.summary,
+                "insight": explanation.insight,
+                "interpretation": explanation.interpretation,
+                "suggestion": explanation.suggestion,
+            }
+        except Exception as e:
+            print(f"[api] Failed to generate explanation for custom chart: {e}", flush=True)
+            # Provide graceful fallback - chart was created, explanation generation is optional
+            explanation_data = {
+                "summary": f"Chart showing {chart_type}",
+                "insight": "AI explanation unavailable",
+                "interpretation": "Please review the visualization directly",
+                "suggestion": "Analyze the data in the chart",
+            }
+
         return JSONResponse(
             {
                 "run_id": run_id,
@@ -783,11 +945,97 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
                 "columns_used": columns_used,
                 "title": title,
                 "instruction": instruction,
+                "explanation": explanation_data,
             }
         )
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Unexpected error: {str(e)}"})
+
+
+@app.post("/charts/explain")
+async def explain_chart(request: ChartExplanationRequest) -> ChartExplanationResponse:
+    """
+    Generate an AI-powered explanation for a visualization.
+    
+    Takes chart metadata (type, axes, dataset, correlation) and generates
+    a human-readable explanation using the Analyst Agent.
+    
+    Response includes:
+    - summary: One-sentence description of what the chart shows
+    - insight: Key finding or pattern in the data
+    - interpretation: What the pattern means (non-technical)
+    - suggestion: Recommended action based on the visualization
+    - cached: Whether this explanation was retrieved from cache
+    
+    The explanation generation:
+    - Runs synchronously (fast with caching)
+    - Fails safely: If LLM unavailable, returns graceful fallback
+    - Caches by hash of dataset + chart_type + x + y
+    """
+    try:
+        # Create metadata object
+        metadata = VisualizationMetadata(
+            chart_type=request.chart_type,
+            x=request.x,
+            y=request.y,
+            dataset=request.dataset,
+            correlation=request.correlation,
+        )
+        
+        # Get environment variables for LLM
+        model = os.getenv("OLLAMA_PHASE3_MODEL", "llama3.2:3b")
+        ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+        
+        # Run explanation generation (async in background would be better, but
+        # we use sync here with caching to keep it fast)
+        explanation = _generate_explanation_sync(
+            metadata=metadata,
+            model=model,
+            host=ollama_host,
+        )
+        
+        return ChartExplanationResponse(
+            summary=explanation.summary,
+            insight=explanation.insight,
+            interpretation=explanation.interpretation,
+            suggestion=explanation.suggestion,
+            cached=False,  # We could track this more precisely with cache stats
+        )
+    
+    except Exception as e:
+        print(f"[api] Error generating chart explanation: {e}", flush=True)
+        # Return graceful fallback if explanation generation fails
+        return ChartExplanationResponse(
+            summary="Chart visualization",
+            insight="Unable to generate explanation",
+            interpretation="Please analyze the chart manually",
+            suggestion="Review the data and visualization parameters",
+            cached=False,
+        )
+
+
+@app.post("/runs/{run_id}/charts/explain")
+async def explain_run_chart(
+    run_id: str,
+    request: ChartExplanationRequest,
+) -> ChartExplanationResponse:
+    """
+    Generate an AI explanation for a chart in the context of a specific run.
+    
+    Same as POST /charts/explain but includes run context validation.
+    Useful for explaining charts generated within a pipeline run.
+    """
+    # Validate run exists
+    state = get_run(run_id)
+    if not state:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Run {run_id} not found"},
+        )
+    
+    # Delegate to main explanation endpoint
+    return await explain_chart(request)
 
 
 @app.get("/health")
@@ -813,6 +1061,8 @@ async def root():
                 "GET /runs/{run_id}/validation": "Get validation_result.json",
                 "GET /runs/{run_id}/stats": "Get descriptive stats for cleaned CSV",
                 "POST /runs/{run_id}/charts/custom": "Generate custom chart from instruction",
+                "POST /charts/explain": "Generate AI explanation for a chart",
+                "POST /runs/{run_id}/charts/explain": "Generate AI explanation for a run's chart",
                 "GET /health": "Health check",
             },
         }

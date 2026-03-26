@@ -101,6 +101,28 @@ class AnalysisResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Visualization Explanation schemas (for AI-generated chart insights)
+# ---------------------------------------------------------------------------
+
+class VisualizationMetadata(BaseModel):
+    """Metadata about a generated visualization for explanation generation."""
+    chart_type: str          # "histogram", "bar", "line", "scatter", "heatmap", "box", "pie"
+    x: str | None = None     # x-axis column or description
+    y: str | None = None     # y-axis column or description
+    dataset: str = ""        # dataset name or description
+    correlation: float | None = None  # if applicable, correlation value
+
+
+class VisualizationExplanation(BaseModel):
+    """AI-generated human-readable explanation of a visualization."""
+    summary: str              # One sentence describing what the chart shows
+    insight: str              # Key finding or pattern visible in the data
+    interpretation: str       # What does the pattern mean? Non-technical explanation
+    suggestion: str           # Recommended action based on this visualization
+    metadata: VisualizationMetadata | None = None  # Original metadata for reference
+
+
+# ---------------------------------------------------------------------------
 # Filesystem helpers
 # ---------------------------------------------------------------------------
 
@@ -461,6 +483,131 @@ def _llm_enrich_insights(
         pass
 
     return key_insights
+
+
+# ---------------------------------------------------------------------------
+# Visualization Explanation Generation
+# ---------------------------------------------------------------------------
+
+import hashlib
+from typing import Dict
+
+# In-memory cache for visualization explanations
+_explanation_cache: Dict[str, VisualizationExplanation] = {}
+
+
+def _compute_explanation_hash(metadata: VisualizationMetadata) -> str:
+    """Compute a hash key for caching explanations based on metadata."""
+    cache_key = f"{metadata.dataset}|{metadata.chart_type}|{metadata.x}|{metadata.y}"
+    return hashlib.md5(cache_key.encode()).hexdigest()
+
+
+def _load_explanation_template(template_path: Path | None = None) -> str:
+    """Load the explanation prompt template from disk."""
+    if template_path is None:
+        template_path = Path(__file__).parent.parent / "prompts" / "analyst_prompt.txt"
+    
+    if template_path.exists():
+        return template_path.read_text(encoding="utf-8")
+    
+    # Fallback template if file not found
+    return """{
+  "summary": "Unable to generate explanation - template not available",
+  "insight": "Please ensure analyst_prompt.txt is configured.",
+  "interpretation": "Chart still renders normally.",
+  "suggestion": "Review system configuration."
+}"""
+
+
+def _format_explanation_prompt(
+    template: str,
+    metadata: VisualizationMetadata,
+) -> str:
+    """Format the prompt template with visualization metadata."""
+    correlation_str = f"{metadata.correlation:.3f}" if metadata.correlation is not None else "N/A"
+    
+    prompt = template.format(
+        chart_type=metadata.chart_type,
+        x=metadata.x or "N/A",
+        y=metadata.y or "N/A",
+        dataset=metadata.dataset or "Unknown",
+        correlation=correlation_str,
+    )
+    return prompt
+
+
+def _generate_explanation_sync(
+    metadata: VisualizationMetadata,
+    model: str = "llama3.2:3b",
+    host: str = "http://127.0.0.1:11434",
+) -> VisualizationExplanation:
+    """
+    Generate a visualization explanation synchronously using Ollama.
+    
+    Includes caching: explanations are cached by hash of metadata.
+    If Ollama is unavailable, returns a graceful fallback.
+    """
+    cache_key = _compute_explanation_hash(metadata)
+    
+    # Check cache first
+    if cache_key in _explanation_cache:
+        return _explanation_cache[cache_key]
+    
+    # Load template
+    template_path = Path(__file__).parent.parent / "prompts" / "analyst_prompt.txt"
+    template = _load_explanation_template(template_path)
+    
+    # Format prompt with metadata
+    prompt = _format_explanation_prompt(template, metadata)
+    
+    # Generate explanation using Ollama
+    if not _ollama_alive(host):
+        # Fallback: return a safe default explanation
+        fallback = VisualizationExplanation(
+            summary=f"Chart showing {metadata.chart_type} visualization",
+            insight="Unable to generate AI insight - LLM unavailable",
+            interpretation="Chart is displayed for manual analysis",
+            suggestion="Review data directly in the visualization",
+            metadata=metadata,
+        )
+        _explanation_cache[cache_key] = fallback
+        return fallback
+    
+    try:
+        raw = _ollama_generate(model=model, prompt=prompt, host=host)
+        
+        if raw:
+            # Try to extract JSON from the response
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                json_str = raw[start:end+1]
+                try:
+                    explanation_dict = json.loads(json_str)
+                    explanation = VisualizationExplanation(
+                        summary=explanation_dict.get("summary", ""),
+                        insight=explanation_dict.get("insight", ""),
+                        interpretation=explanation_dict.get("interpretation", ""),
+                        suggestion=explanation_dict.get("suggestion", ""),
+                        metadata=metadata,
+                    )
+                    _explanation_cache[cache_key] = explanation
+                    return explanation
+                except json.JSONDecodeError:
+                    pass
+    except Exception as e:
+        print(f"[analyst] Error generating explanation: {e}", flush=True)
+    
+    # Fallback if LLM generation fails
+    fallback = VisualizationExplanation(
+        summary=f"Chart showing {metadata.chart_type} visualization",
+        insight="LLM explanation generation failed",
+        interpretation="Please review the visualization manually",
+        suggestion="Check data quality and visualization parameters",
+        metadata=metadata,
+    )
+    _explanation_cache[cache_key] = fallback
+    return fallback
 
 
 # ---------------------------------------------------------------------------
