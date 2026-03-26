@@ -7,9 +7,11 @@ Responsibilities:
   1. Chart-type selection  — bar, line, scatter, histogram, heatmap, box, pie
                              chosen automatically from column dtypes + correlations
   2. Plot generation       — matplotlib / seaborn, high-DPI PNG per chart
-  3. Optional LLM pass     — Ollama writes bespoke chart code for edge cases
-  4. Output                — individual PNGs + viz_summary.json consumed by
-                             Validation Agent and Streamlit UI
+  3. Explanation JSON      — deterministic plain-English explanations per chart
+                             derived from analysis metadata (no LLM required)
+  4. Optional LLM pass     — Ollama writes bespoke chart code for edge cases
+  5. Output                — individual PNGs + viz_summary.json + chart_explanations.json
+                             consumed by Validation Agent and frontend UI
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ import seaborn as sns
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # ---------------------------------------------------------------------------
-# Chart manifest schema  (consumed by Validation Agent + Streamlit)
+# Chart manifest schema  (consumed by Validation Agent + frontend)
 # ---------------------------------------------------------------------------
 
 class ChartRecord(BaseModel):
@@ -280,6 +282,7 @@ def _select_charts(
     """
     Decide which charts to produce based on column dtypes, cardinality,
     trend info, and top correlations from the Analysis Agent's output.
+    Returns the list of ChartRecord objects created.
     """
     _apply_theme()
     charts: list[ChartRecord] = []
@@ -373,6 +376,244 @@ def _select_charts(
             except Exception as e:
                 print(f"[artist] Warning: Failed to create timeseries chart for {dt_col} vs {num_col}: {e}")
                 continue
+
+    # ── CRITICAL FIX: return the charts list ─────────────────────────────
+    return charts
+
+
+# ---------------------------------------------------------------------------
+# Chart Explanation Generator  (deterministic — no LLM)
+# ---------------------------------------------------------------------------
+
+def _generate_chart_explanations(
+    charts: list[ChartRecord],
+    analysis: dict[str, Any],
+    run_dir: Path,
+) -> dict[str, Any]:
+    """
+    Generate plain-English explanations for every chart by combining:
+      - chart metadata (type, columns)
+      - column statistics from the Analysis Agent (mean, std, outliers, trend …)
+      - correlation pairs from the Analysis Agent
+      - key insights already identified
+
+    Writes chart_explanations.json to run_dir.
+    Returns the explanations dict.
+    """
+    # Build lookup maps from analysis JSON
+    col_stats_map: dict[str, dict] = {
+        s["column"]: s
+        for s in analysis.get("column_stats", [])
+        if isinstance(s, dict) and "column" in s
+    }
+
+    # Bidirectional correlation lookup: (col_a, col_b) → corr_record
+    corr_map: dict[tuple[str, str], dict] = {}
+    for c in analysis.get("correlations", []):
+        if isinstance(c, dict) and "col_a" in c and "col_b" in c:
+            corr_map[(c["col_a"], c["col_b"])] = c
+            corr_map[(c["col_b"], c["col_a"])] = c
+
+    key_insights: list[str] = analysis.get("key_insights", [])
+
+    # ── Helpers ──────────────────────────────────────────────────────────
+
+    def _fmt(v: float | None, decimals: int = 2) -> str:
+        if v is None:
+            return "N/A"
+        try:
+            return f"{v:,.{decimals}f}"
+        except (TypeError, ValueError):
+            return str(v)
+
+    def _explain_chart(chart: ChartRecord) -> str:
+        ct = chart.chart_type
+        cols = chart.columns_used
+
+        # ── Histogram ────────────────────────────────────────────────────
+        if ct == "histogram" and cols:
+            col = cols[0]
+            s = col_stats_map.get(col, {})
+            parts: list[str] = [f"This histogram shows the frequency distribution of '{col}'."]
+            if s.get("mean") is not None:
+                parts.append(
+                    f"The average value is {_fmt(s['mean'])} "
+                    f"with a standard deviation of {_fmt(s.get('std'))}."
+                )
+            if s.get("min") is not None and s.get("max") is not None:
+                parts.append(f"Values range from {_fmt(s['min'])} to {_fmt(s['max'])}.")
+            trend = s.get("trend")
+            if trend and trend != "flat":
+                parts.append(f"The column shows a {trend} trend across the dataset.")
+            oc = s.get("outlier_count", 0) or 0
+            if oc:
+                parts.append(
+                    f"{oc} outlier(s) detected via IQR method (shown as a red rug at the bottom)."
+                )
+            mp = s.get("missing_pct", 0) or 0
+            if mp > 5:
+                parts.append(f"Note: {mp:.1f}% of values were missing before cleaning.")
+            return " ".join(parts)
+
+        # ── Scatter ──────────────────────────────────────────────────────
+        if ct == "scatter" and len(cols) >= 2:
+            a, b = cols[0], cols[1]
+            corr = corr_map.get((a, b)) or corr_map.get((b, a))
+            parts = [f"This scatter plot reveals the relationship between '{a}' and '{b}'."]
+            if corr:
+                r = corr.get("pearson_r", 0)
+                strength = corr.get("strength", "")
+                direction = corr.get("direction", "")
+                parts.append(
+                    f"Pearson r = {r:+.3f}, indicating a {strength} {direction} linear correlation."
+                )
+                if abs(r) >= 0.7:
+                    parts.append(
+                        "The dashed orange line shows the linear regression fit — "
+                        "this is a strong predictor relationship worth investigating further."
+                    )
+                elif abs(r) >= 0.4:
+                    parts.append(
+                        "A moderate association exists; other factors likely also influence this relationship."
+                    )
+            else:
+                parts.append(
+                    "A linear regression line is overlaid to indicate the general trend direction. "
+                    "Red points are IQR-detected outliers."
+                )
+            return " ".join(parts)
+
+        # ── Heatmap ──────────────────────────────────────────────────────
+        if ct == "heatmap":
+            num_cols = len(cols)
+            strong_pairs = [
+                f"'{c['col_a']}' ↔ '{c['col_b']}' (r={c['pearson_r']:+.2f})"
+                for c in analysis.get("correlations", [])
+                if c.get("strength") == "strong"
+            ][:3]
+            parts = [
+                f"This correlation heatmap shows pairwise Pearson coefficients across "
+                f"{num_cols} numeric column(s).",
+                "Warm reds indicate strong positive correlation; cool blues indicate negative correlation.",
+                "Values near zero (white) suggest no linear relationship.",
+            ]
+            if strong_pairs:
+                parts.append(f"Strongest pairs: {', '.join(strong_pairs)}.")
+            return " ".join(parts)
+
+        # ── Bar ──────────────────────────────────────────────────────────
+        if ct == "bar" and cols:
+            col = cols[0]
+            ci = next(
+                (x for x in analysis.get("categorical_insights", []) if x.get("column") == col),
+                {},
+            )
+            unique = ci.get("unique_count", "?")
+            parts = [
+                f"This bar chart shows the frequency of the most common values in '{col}' "
+                f"({unique} unique value(s) total).",
+                "Taller bars represent more frequently occurring categories.",
+            ]
+            top = (ci.get("top_values") or [{}])[:1]
+            if top and top[0].get("value"):
+                parts.append(
+                    f"The most common value is '{top[0]['value']}' "
+                    f"({top[0].get('pct', '?')}% of records)."
+                )
+            return " ".join(parts)
+
+        # ── Pie ──────────────────────────────────────────────────────────
+        if ct == "pie" and cols:
+            col = cols[0]
+            ci = next(
+                (x for x in analysis.get("categorical_insights", []) if x.get("column") == col),
+                {},
+            )
+            parts = [
+                f"This pie chart shows the proportional breakdown of '{col}'.",
+                "Each slice represents a category's share of the total record count.",
+            ]
+            top = (ci.get("top_values") or [{}])[:1]
+            if top and top[0].get("value"):
+                parts.append(
+                    f"The dominant category is '{top[0]['value']}' at {top[0].get('pct', '?')}%."
+                )
+            return " ".join(parts)
+
+        # ── Line / timeseries ────────────────────────────────────────────
+        if ct == "line" and cols:
+            col = cols[0]
+            s = col_stats_map.get(col, {})
+            trend = s.get("trend") or "stable"
+            parts = [
+                f"This line chart tracks '{col}' across dataset rows, "
+                f"showing a {trend} trend.",
+            ]
+            if s.get("mean") is not None:
+                parts.append(
+                    f"The mean is {_fmt(s['mean'])} (range: {_fmt(s.get('min'))} – {_fmt(s.get('max'))})."
+                )
+            if len(cols) >= 2:
+                parts[0] = (
+                    f"This time-series line chart plots '{cols[1]}' over '{cols[0]}', "
+                    f"revealing a {trend} trend."
+                )
+            return " ".join(parts)
+
+        # ── Box ──────────────────────────────────────────────────────────
+        if ct == "box":
+            outlier_cols = [
+                f"'{a.get('column')}' ({a.get('outlier_count')})"
+                for a in analysis.get("anomalies", [])
+                if a.get("column") in cols and a.get("outlier_count", 0) > 0
+            ]
+            parts = [
+                f"This box plot summarises the spread of {len(cols)} numeric column(s).",
+                "Each box spans the interquartile range (Q1–Q3); the line marks the median.",
+                "Red diamond markers indicate IQR-detected outliers.",
+            ]
+            if outlier_cols:
+                parts.append(f"Columns with notable outliers: {', '.join(outlier_cols)}.")
+            return " ".join(parts)
+
+        # ── Fallback ─────────────────────────────────────────────────────
+        col_list = ", ".join(f"'{c}'" for c in cols) if cols else "the dataset"
+        return f"This {ct} chart visualises {col_list}."
+
+    def _stats_for_chart(chart: ChartRecord) -> dict[str, Any]:
+        """Extract relevant numeric stats for the primary column of a chart."""
+        if not chart.columns_used:
+            return {}
+        col = chart.columns_used[0]
+        s = col_stats_map.get(col, {})
+        wanted = ["mean", "median", "std", "min", "max", "outlier_count", "trend",
+                  "missing_count", "missing_pct"]
+        return {k: s[k] for k in wanted if k in s}
+
+    # ── Build explanations list ───────────────────────────────────────────
+    explanations: list[dict[str, Any]] = []
+    for chart in charts:
+        explanations.append({
+            "filename": Path(chart.png_path).name,
+            "chart_id": chart.chart_id,
+            "chart_type": chart.chart_type,
+            "columns_used": chart.columns_used,
+            "title": chart.title,
+            "generated_by": chart.generated_by,
+            "explanation": _explain_chart(chart),
+            "stats": _stats_for_chart(chart),
+        })
+
+    result: dict[str, Any] = {
+        "timestamp": dt.datetime.now(timezone.utc).isoformat(),
+        "total_charts": len(charts),
+        "key_insights": key_insights,
+        "explanations": explanations,
+    }
+
+    _write_json(run_dir / "chart_explanations.json", result)
+    print(f"[artist] chart_explanations.json written ({len(explanations)} entries)", flush=True)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +786,7 @@ def _run_llm_chart(
 
 
 # ---------------------------------------------------------------------------
-# Core runner  (importable by Streamlit / Validation Agent)
+# Core runner  (importable by graph.py / Validation Agent)
 # ---------------------------------------------------------------------------
 
 def run_visualization(
@@ -559,6 +800,13 @@ def run_visualization(
 ) -> dict[str, Any]:
     """
     Main visualization pipeline. Returns the viz_summary dict.
+
+    Pipeline:
+      1. Generate charts via _select_charts (builtin, deterministic)
+      2. Extract per-chart metadata + column stats from analysis
+      3. Write chart_explanations.json (used by API + frontend)
+      4. Optionally generate one LLM bespoke chart
+      5. Write viz_summary.json
 
     Parameters
     ----------
@@ -596,10 +844,12 @@ def run_visualization(
             source = p3.get("source", str(enriched_csv_path))
             source_type = p3.get("source_type", "csv")
 
-    # Generate built-in charts
+    # ── Step 1: Generate built-in charts ─────────────────────────────────
+    print("[artist] Generating charts...", flush=True)
     charts = _select_charts(df, analysis, run_dir)
+    print(f"[artist] {len(charts)} chart(s) generated.", flush=True)
 
-    # Optional LLM bespoke chart
+    # ── Step 2: Optional LLM bespoke chart ───────────────────────────────
     if use_llm:
         bespoke = _run_llm_chart(df, analysis, run_dir, model=model, host=ollama_host)
         if bespoke:
@@ -607,6 +857,11 @@ def run_visualization(
         else:
             print("[artist] Warning: LLM bespoke chart generation failed or returned nothing.")
 
+    # ── Step 3: Extract metadata + write chart_explanations.json ─────────
+    print("[artist] Generating chart explanations...", flush=True)
+    _generate_chart_explanations(charts, analysis, run_dir)
+
+    # ── Step 4: Write viz_summary.json ───────────────────────────────────
     summary = VizSummary(
         source=source,
         source_type=source_type,

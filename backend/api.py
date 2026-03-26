@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
-import os
 import re
 from pathlib import Path
 from typing import Any
@@ -32,11 +31,6 @@ _ENV_PATH = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=_ENV_PATH)
 
 from .graph import create_run, get_run, execute_run, PipelineState
-from .agents.analyst import (
-    VisualizationMetadata,
-    VisualizationExplanation,
-    _generate_explanation_sync,
-)
 
 
 app = fastapi.FastAPI(
@@ -82,24 +76,6 @@ class CustomChartRequest(BaseModel):
     instruction: str
 
 
-class ChartExplanationRequest(BaseModel):
-    """Request for generating AI explanation of a visualization."""
-    chart_type: str          # e.g. "histogram", "scatter", "bar", "line"
-    x: str | None = None     # x-axis column or description
-    y: str | None = None     # y-axis column or description
-    dataset: str = ""        # dataset name or description
-    correlation: float | None = None  # if applicable
-
-
-class ChartExplanationResponse(BaseModel):
-    """Response containing AI-generated visualization explanation."""
-    summary: str              # One sentence describing the chart
-    insight: str              # Key finding or pattern
-    interpretation: str       # What does it mean? (non-technical)
-    suggestion: str           # Recommended action
-    cached: bool = False      # Whether this came from cache
-
-
 # ============================================================================
 # Endpoints
 # ============================================================================
@@ -111,29 +87,29 @@ async def start_pipeline(
 ) -> RunResponse:
     """
     Start a new pipeline run.
-    
+
     Accepts either:
     - Multipart form data with 'file' field (CSV/XLSX/JSON)
     - Form data with 'source' field (URL/path)
-    
+
     Returns run_id for polling.
     Pipeline runs in background; use GET /runs/{run_id} to check progress.
     """
     input_source = None
     source_type = "auto"
-    
+
     # Handle file upload
     if file:
         try:
             # Save file to temporary location
             temp_dir = Path(__file__).parent / "runs" / "uploads"
             temp_dir.mkdir(parents=True, exist_ok=True)
-            
+
             file_path = temp_dir / file.filename
             content = await file.read()
             with open(file_path, "wb") as f:
                 f.write(content)
-            
+
             input_source = str(file_path)
             source_type = "uploaded_file"  # Mark as uploaded file so scout is skipped
         except Exception as e:
@@ -141,23 +117,23 @@ async def start_pipeline(
                 status_code=400,
                 content={"error": f"Failed to save uploaded file: {e}"},
             )
-    
+
     # Handle form data source
     elif source:
         input_source = source.strip()
-    
+
     if not input_source:
         return JSONResponse(
             status_code=400,
             content={"error": "file upload or source (URL/path) is required"},
         )
-    
+
     # Create run with source_type info
     run_id = create_run(input_source, source_type=source_type)
-    
+
     # Execute in background
     asyncio.create_task(_execute_async(run_id))
-    
+
     state = get_run(run_id)
     return RunResponse(
         run_id=run_id,
@@ -177,26 +153,26 @@ async def _execute_async(run_id: str) -> None:
 async def start_pipeline_json(request: RunRequest) -> RunResponse:
     """
     Start a new pipeline run from JSON body.
-    
+
     Accepts JSON with 'source' or 'url' field.
-    
+
     Returns run_id for polling.
     Pipeline runs in background; use GET /runs/{run_id} to check progress.
     """
     input_source = (request.source or request.url or "").strip()
-    
+
     if not input_source:
         return JSONResponse(
             status_code=400,
             content={"error": "source or url is required"},
         )
-    
+
     # Create run (auto-detects source_type)
     run_id = create_run(input_source, source_type="auto")
-    
+
     # Execute in background
     asyncio.create_task(_execute_async(run_id))
-    
+
     state = get_run(run_id)
     return RunResponse(
         run_id=run_id,
@@ -210,7 +186,7 @@ async def start_pipeline_json(request: RunRequest) -> RunResponse:
 async def get_run_status(run_id: str):
     """
     Get current status of a pipeline run.
-    
+
     Returns: phase (scout|labeler|analyst|artist|validator|complete), status, error if any.
     """
     state = get_run(run_id)
@@ -219,7 +195,7 @@ async def get_run_status(run_id: str):
             status_code=404,
             content={"error": f"Run {run_id} not found"},
         )
-    
+
     return RunResponse(
         run_id=run_id,
         phase=state["phase"],
@@ -239,7 +215,7 @@ async def get_run_status(run_id: str):
 async def download_csv(run_id: str):
     """
     Download cleaned_data.csv from Phase 2+ output.
-    
+
     Returns 404 if run not found or phase hasn't completed data cleaning.
     """
     state = get_run(run_id)
@@ -248,20 +224,20 @@ async def download_csv(run_id: str):
             status_code=404,
             content={"error": f"Run {run_id} not found"},
         )
-    
+
     if not state["labeler_output_dir"]:
         return JSONResponse(
             status_code=202,  # Accepted, not ready yet
             content={"error": "Labeler phase not yet complete"},
         )
-    
+
     csv_path = Path(state["labeler_output_dir"]) / "cleaned_data.csv"
     if not csv_path.exists():
         return JSONResponse(
             status_code=404,
             content={"error": f"CSV not found at {csv_path}"},
         )
-    
+
     return FileResponse(
         csv_path,
         media_type="text/csv",
@@ -270,32 +246,11 @@ async def download_csv(run_id: str):
 
 
 @app.get("/runs/{run_id}/images")
-async def list_images(run_id: str, include_explanations: bool = False):
+async def list_images(run_id: str):
     """
     List all PNG images from Phase 3 output.
-    
-    Query params:
-    - include_explanations: if true, also generate AI explanations for each chart
-    
-    Returns: 
-    - Without explanations: {images: [filename1.png, filename2.png, ...], count: N}
-    - With explanations: {
-        visualizations: [
-          {
-            filename: "...",
-            title: "...",
-            chart_type: "...",
-            explanation: {
-              summary: "...",
-              insight: "...",
-              interpretation: "...",
-              suggestion: "..."
-            }
-          },
-          ...
-        ],
-        count: N
-      }
+
+    Returns: {images: [filename1.png, filename2.png, ...]}
     """
     state = get_run(run_id)
     if not state:
@@ -303,109 +258,29 @@ async def list_images(run_id: str, include_explanations: bool = False):
             status_code=404,
             content={"error": f"Run {run_id} not found"},
         )
-    
+
     if not state["artist_output_dir"]:
         return JSONResponse(
             status_code=202,
             content={"images": [], "message": "Artist phase not yet complete"},
         )
-    
+
     output_dir = Path(state["artist_output_dir"])
     pngs = sorted([f.name for f in output_dir.glob("*.png")])
-    
-    if not include_explanations:
-        # Standard response: just list filenames
-        return JSONResponse(
-            {
-                "images": pngs,
-                "count": len(pngs),
-            }
-        )
-    
-    # Enhanced response with explanations
-    visualizations = []
-    
-    # Try to load viz_summary.json for chart metadata
-    viz_summary_path = output_dir / "viz_summary.json"
-    chart_metadata = {}
-    if viz_summary_path.exists():
-        try:
-            viz_data = _read_json_file(viz_summary_path)
-            # Index by PNG filename for quick lookup
-            if "charts" in viz_data:
-                for chart in viz_data["charts"]:
-                    if "png_path" in chart:
-                        # Extract filename from path
-                        png_filename = Path(chart["png_path"]).name
-                        chart_metadata[png_filename] = chart
-        except Exception as e:
-            print(f"[api] Failed to load viz_summary.json: {e}", flush=True)
-    
-    # Generate visualization cards with explanations
-    for png_filename in pngs:
-        chart_info = chart_metadata.get(png_filename, {})
-        chart_type = chart_info.get("chart_type", "unknown")
-        columns_used = chart_info.get("columns_used", [])
-        title = chart_info.get("title", f"Chart: {png_filename}")
-        
-        # Create metadata for explanation generation
-        x_col = columns_used[0] if len(columns_used) > 0 else None
-        y_col = columns_used[1] if len(columns_used) > 1 else None
-        
-        metadata = VisualizationMetadata(
-            chart_type=chart_type,
-            x=x_col,
-            y=y_col,
-            dataset=f"Run {run_id}",
-            correlation=None,
-        )
-        
-        # Generate explanation
-        try:
-            model = os.getenv("OLLAMA_PHASE3_MODEL", "llama3.2:3b")
-            ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-            explanation = _generate_explanation_sync(
-                metadata=metadata,
-                model=model,
-                host=ollama_host,
-            )
-            explanation_data = {
-                "summary": explanation.summary,
-                "insight": explanation.insight,
-                "interpretation": explanation.interpretation,
-                "suggestion": explanation.suggestion,
-            }
-        except Exception as e:
-            print(f"[api] Failed to generate explanation for {png_filename}: {e}", flush=True)
-            explanation_data = {
-                "summary": f"Chart visualization",
-                "insight": "Explanation generation unavailable",
-                "interpretation": "Please review the chart manually",
-                "suggestion": "Analyze the data and visualization directly",
-            }
-        
-        visualizations.append({
-            "filename": png_filename,
-            "title": title,
-            "chart_type": chart_type,
-            "columns_used": columns_used,
-            "explanation": explanation_data,
-        })
-    
+
     return JSONResponse(
         {
-            "visualizations": visualizations,
-            "count": len(visualizations),
+            "images": pngs,
+            "count": len(pngs),
         }
     )
-
 
 
 @app.get("/runs/{run_id}/images/{filename}", response_model=None)
 async def download_image(run_id: str, filename: str):
     """
     Download a specific PNG image from Phase 3 output.
-    
+
     Prevents path traversal attacks by validating filename.
     """
     # Validate filename (prevent path traversal)
@@ -414,21 +289,21 @@ async def download_image(run_id: str, filename: str):
             status_code=400,
             content={"error": "Invalid filename"},
         )
-    
+
     state = get_run(run_id)
     if not state or not state["artist_output_dir"]:
         return JSONResponse(
             status_code=404,
             content={"error": f"Run {run_id} or output not found"},
         )
-    
+
     image_path = Path(state["artist_output_dir"]) / filename
     if not image_path.exists() or not image_path.suffix.lower() == ".png":
         return JSONResponse(
             status_code=404,
             content={"error": f"Image not found: {filename}"},
         )
-    
+
     return FileResponse(
         image_path,
         media_type="image/png",
@@ -440,7 +315,7 @@ async def download_image(run_id: str, filename: str):
 async def get_report(run_id: str):
     """
     Get markdown report from final outputs.
-    
+
     Returns: {content: "markdown content as string"}
     """
     state = get_run(run_id)
@@ -449,7 +324,7 @@ async def get_report(run_id: str):
             status_code=404,
             content={"error": f"Run {run_id} not found"},
         )
-    
+
     output_dir = (
         state["validator_output_dir"]
         or state["artist_output_dir"]
@@ -475,7 +350,7 @@ async def get_report(run_id: str):
             status_code=404,
             content={"error": "No report found (expected validation_report.md or analysis_report.md)"},
         )
-    
+
     content = report_path.read_text(encoding="utf-8")
     return JSONResponse(
         {
@@ -483,6 +358,60 @@ async def get_report(run_id: str):
             "filename": filename,
         }
     )
+
+
+@app.get("/runs/{run_id}/chart-explanations")
+async def get_chart_explanations(run_id: str):
+    """
+    Get per-chart plain-English explanations generated by the Artist Agent.
+
+    Returns chart_explanations.json which contains:
+      - explanations[]: list of {filename, chart_type, columns_used, title,
+                                  explanation, stats, generated_by}
+      - key_insights[]: high-level dataset insights from the Analyst Agent
+      - total_charts: int
+      - timestamp: ISO datetime
+
+    Available once the artist phase completes.
+    """
+    state = get_run(run_id)
+    if not state:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Run {run_id} not found"},
+        )
+
+    output_dir = _resolve_pipeline_output_dir(state)
+    if not output_dir:
+        return JSONResponse(
+            status_code=202,
+            content={"error": "Artist phase not yet complete — explanations not available"},
+        )
+
+    explanations_path = output_dir / "chart_explanations.json"
+    if not explanations_path.exists():
+        # Attempt to generate on-the-fly from existing artifacts
+        viz_summary_path = output_dir / "viz_summary.json"
+        analysis_json_path = output_dir / "analysis_result.json"
+        if viz_summary_path.exists() and analysis_json_path.exists():
+            try:
+                from .agents.artist import _generate_chart_explanations, ChartRecord
+                viz = _read_json_file(viz_summary_path)
+                analysis = _read_json_file(analysis_json_path)
+                charts = [ChartRecord(**c) for c in viz.get("charts", [])]
+                _generate_chart_explanations(charts, analysis, output_dir)
+            except Exception as e:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"chart_explanations.json not found and could not be generated: {e}"},
+                )
+        else:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "chart_explanations.json not found — artist phase may not have completed"},
+            )
+
+    return JSONResponse(_read_json_file(explanations_path))
 
 
 @app.get("/runs/{run_id}/validation")
@@ -588,41 +517,41 @@ def _extract_columns_from_instruction(instruction: str, columns: list[str]) -> l
     """
     instruction_norm = _normalize_token(instruction)
     instruction_words = set(re.findall(r'\b\w+\b', instruction.lower()))
-    
+
     matched: list[str] = []
     scored_matches: dict[str, int] = {}
-    
+
     for col in columns:
         col_norm = _normalize_token(col)
         col_words = set(re.findall(r'\b\w+\b', col.lower()))
-        
+
         if not col_norm:
             continue
-        
+
         score = 0
-        
+
         # Strategy 1: Exact substring in normalized version (high confidence)
         if col_norm in instruction_norm:
             score += 10
-        
+
         # Strategy 2: Word match in original text (medium confidence)
         for word in col_words:
             if word in instruction_words:
                 score += 5
-        
+
         # Strategy 3: Partial substring match (lower confidence, but catches typos)
-        if any(col_norm.startswith(word) or word.startswith(col_norm[:3]) 
+        if any(col_norm.startswith(word) or word.startswith(col_norm[:3])
                for word in instruction_words if len(word) >= 3):
             score += 2
-        
+
         if score > 0:
             scored_matches[col] = score
-    
+
     # Return columns sorted by score (highest first)
     if scored_matches:
         matched = sorted(scored_matches.items(), key=lambda x: x[1], reverse=True)
         matched = [col for col, _ in matched]
-    
+
     return matched
 
 
@@ -681,7 +610,7 @@ async def get_descriptive_stats(run_id: str):
 async def create_custom_chart(run_id: str, request: CustomChartRequest):
     """
     Generate a custom chart from a natural-language instruction.
-    
+
     Supports: histogram, scatter, line, bar charts.
     Uses fuzzy column matching to find relevant data.
     """
@@ -707,7 +636,7 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
             df = pd.read_csv(csv_path)
         except Exception as e:
             return JSONResponse(status_code=500, content={"error": f"Failed to read CSV: {str(e)}"})
-        
+
         if df.empty:
             return JSONResponse(status_code=400, content={"error": "cleaned_data.csv is empty"})
 
@@ -746,19 +675,19 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
                 elif numeric_cols:
                     col = numeric_cols[0]
                 else:
-                    return JSONResponse(status_code=400, 
-                                      content={"error": "No numeric columns available for histogram. Got: " + ", ".join(columns[:5])})
+                    return JSONResponse(status_code=400,
+                                        content={"error": "No numeric columns available for histogram. Got: " + ", ".join(columns[:5])})
 
                 # Extract numeric data
                 try:
                     data = pd.to_numeric(df[col], errors="coerce").dropna()
                 except Exception as e:
-                    return JSONResponse(status_code=400, 
-                                      content={"error": f"Column '{col}' conversion failed: {str(e)}"})
-                
+                    return JSONResponse(status_code=400,
+                                        content={"error": f"Column '{col}' conversion failed: {str(e)}"})
+
                 if data.empty or len(data) == 0:
-                    return JSONResponse(status_code=400, 
-                                      content={"error": f"Column '{col}' has no numeric values ({len(df)} rows, {len(data)} numeric)"})
+                    return JSONResponse(status_code=400,
+                                        content={"error": f"Column '{col}' has no numeric values ({len(df)} rows, {len(data)} numeric)"})
 
                 try:
                     fig, ax = plt.subplots(figsize=(10, 5))
@@ -770,9 +699,9 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
                     fig.savefig(output_path, dpi=200, bbox_inches='tight')
                     plt.close(fig)
                 except Exception as e:
-                    return JSONResponse(status_code=500, 
-                                      content={"error": f"Failed to render histogram: {str(e)}"})
-                
+                    return JSONResponse(status_code=500,
+                                        content={"error": f"Failed to render histogram: {str(e)}"})
+
                 columns_used = [col]
                 title = f"Histogram: {col}"
 
@@ -787,8 +716,8 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
                     x_col, y_col = numeric_cols[0], numeric_cols[1]
                 else:
                     available = ", ".join(columns[:10]) + ("..." if len(columns) > 10 else "")
-                    return JSONResponse(status_code=400, 
-                                      content={"error": f"Need at least 2 columns for {chart_type}. Available: {available}"})
+                    return JSONResponse(status_code=400,
+                                        content={"error": f"Need at least 2 columns for {chart_type}. Available: {available}"})
 
                 # Prepare data
                 try:
@@ -796,12 +725,12 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
                     plot_df[y_col] = pd.to_numeric(plot_df[y_col], errors="coerce")
                     plot_df = plot_df.dropna()
                 except Exception as e:
-                    return JSONResponse(status_code=400, 
-                                      content={"error": f"Data prep failed for {x_col}/{y_col}: {str(e)}"})
-                
+                    return JSONResponse(status_code=400,
+                                        content={"error": f"Data prep failed for {x_col}/{y_col}: {str(e)}"})
+
                 if plot_df.empty or len(plot_df) == 0:
-                    return JSONResponse(status_code=400, 
-                                      content={"error": f"No valid data for {x_col} vs {y_col} ({len(df)} rows, {len(plot_df)} after cleaning)"})
+                    return JSONResponse(status_code=400,
+                                        content={"error": f"No valid data for {x_col} vs {y_col} ({len(df)} rows, {len(plot_df)} after cleaning)"})
 
                 try:
                     fig, ax = plt.subplots(figsize=(10, 5.5))
@@ -817,9 +746,9 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
                     fig.savefig(output_path, dpi=200, bbox_inches='tight')
                     plt.close(fig)
                 except Exception as e:
-                    return JSONResponse(status_code=500, 
-                                      content={"error": f"Failed to render {chart_type}: {str(e)}"})
-                
+                    return JSONResponse(status_code=500,
+                                        content={"error": f"Failed to render {chart_type}: {str(e)}"})
+
                 columns_used = [x_col, y_col]
                 title = f"{chart_type.title()}: {x_col} and {y_col}"
 
@@ -830,14 +759,14 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
                         bar_df = df[[x_col, y_col]].copy()
                         bar_df[y_col] = pd.to_numeric(bar_df[y_col], errors="coerce")
                         grouped = bar_df.dropna().groupby(x_col, as_index=False)[y_col].mean()
-                        
+
                         if len(grouped) > 20:
                             grouped = grouped.nlargest(20, y_col)
-                        
+
                         if grouped.empty or len(grouped) == 0:
-                            return JSONResponse(status_code=400, 
-                                              content={"error": f"No valid data for bar chart: {x_col}, {y_col}"})
-                        
+                            return JSONResponse(status_code=400,
+                                                content={"error": f"No valid data for bar chart: {x_col}, {y_col}"})
+
                         fig, ax = plt.subplots(figsize=(10, 5.5))
                         sns.barplot(data=grouped, x=x_col, y=y_col, ax=ax)
                         ax.set_title(f"Bar Chart: mean {y_col} by {x_col}")
@@ -850,11 +779,11 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
                         # Single column bar - show value counts
                         x_col = matched_cols[0] if matched_cols else columns[0]
                         counts = df[x_col].astype(str).value_counts().head(20)
-                        
+
                         if counts.empty or len(counts) == 0:
-                            return JSONResponse(status_code=400, 
-                                              content={"error": f"No data for bar chart in column: {x_col}"})
-                        
+                            return JSONResponse(status_code=400,
+                                                content={"error": f"No data for bar chart in column: {x_col}"})
+
                         fig, ax = plt.subplots(figsize=(10, 5.5))
                         sns.barplot(x=counts.index, y=counts.values, ax=ax)
                         ax.set_title(f"Bar Chart: top values in {x_col}")
@@ -863,13 +792,13 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
                         plt.setp(ax.get_xticklabels(), rotation=30, ha='right')
                         columns_used = [x_col]
                         title = f"Bar: top values in {x_col}"
-                    
+
                     plt.tight_layout()
                     fig.savefig(output_path, dpi=200, bbox_inches='tight')
                     plt.close(fig)
                 except Exception as e:
-                    return JSONResponse(status_code=500, 
-                                      content={"error": f"Failed to render bar chart: {str(e)}"})
+                    return JSONResponse(status_code=500,
+                                        content={"error": f"Failed to render bar chart: {str(e)}"})
 
         except Exception as e:
             return JSONResponse(status_code=500, content={"error": f"Chart generation failed: {str(e)}"})
@@ -881,7 +810,7 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
                 summary = _read_json_file(viz_summary_path)
             else:
                 summary = {"charts": [], "timestamp": dt.datetime.utcnow().isoformat()}
-            
+
             charts = summary.get("charts", [])
             charts.append(
                 {
@@ -896,46 +825,38 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
             summary["charts"] = charts
             summary["timestamp"] = dt.datetime.utcnow().isoformat()
             viz_summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            # Also update chart_explanations.json with a simple entry for the new chart
+            explanations_path = output_dir / "chart_explanations.json"
+            if explanations_path.exists():
+                try:
+                    exp_data = _read_json_file(explanations_path)
+                    col_list = ", ".join(f"'{c}'" for c in columns_used)
+                    exp_data["explanations"].append({
+                        "filename": filename,
+                        "chart_id": output_path.stem,
+                        "chart_type": chart_type,
+                        "columns_used": columns_used,
+                        "title": title,
+                        "generated_by": "custom_instruction",
+                        "explanation": (
+                            f"Custom {chart_type} chart created from the instruction: "
+                            f"\"{instruction}\". "
+                            f"Columns used: {col_list}."
+                        ),
+                        "stats": {},
+                    })
+                    exp_data["total_charts"] = len(exp_data["explanations"])
+                    exp_data["timestamp"] = dt.datetime.utcnow().isoformat()
+                    explanations_path.write_text(
+                        json.dumps(exp_data, ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
+                except Exception:
+                    pass  # Non-critical — chart was created successfully
+
         except Exception as e:
             # Log but don't fail - chart was created successfully
             print(f"[WARNING] Failed to update viz_summary.json: {e}", flush=True)
-
-        # Generate AI explanation for the chart
-        explanation_data = None
-        try:
-            x_col = columns_used[0] if len(columns_used) > 0 else None
-            y_col = columns_used[1] if len(columns_used) > 1 else None
-            
-            metadata = VisualizationMetadata(
-                chart_type=chart_type,
-                x=x_col,
-                y=y_col,
-                dataset=f"Run {run_id}",
-                correlation=None,
-            )
-            
-            model = os.getenv("OLLAMA_PHASE3_MODEL", "llama3.2:3b")
-            ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-            explanation = _generate_explanation_sync(
-                metadata=metadata,
-                model=model,
-                host=ollama_host,
-            )
-            explanation_data = {
-                "summary": explanation.summary,
-                "insight": explanation.insight,
-                "interpretation": explanation.interpretation,
-                "suggestion": explanation.suggestion,
-            }
-        except Exception as e:
-            print(f"[api] Failed to generate explanation for custom chart: {e}", flush=True)
-            # Provide graceful fallback - chart was created, explanation generation is optional
-            explanation_data = {
-                "summary": f"Chart showing {chart_type}",
-                "insight": "AI explanation unavailable",
-                "interpretation": "Please review the visualization directly",
-                "suggestion": "Analyze the data in the chart",
-            }
 
         return JSONResponse(
             {
@@ -945,97 +866,11 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
                 "columns_used": columns_used,
                 "title": title,
                 "instruction": instruction,
-                "explanation": explanation_data,
             }
         )
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Unexpected error: {str(e)}"})
-
-
-@app.post("/charts/explain")
-async def explain_chart(request: ChartExplanationRequest) -> ChartExplanationResponse:
-    """
-    Generate an AI-powered explanation for a visualization.
-    
-    Takes chart metadata (type, axes, dataset, correlation) and generates
-    a human-readable explanation using the Analyst Agent.
-    
-    Response includes:
-    - summary: One-sentence description of what the chart shows
-    - insight: Key finding or pattern in the data
-    - interpretation: What the pattern means (non-technical)
-    - suggestion: Recommended action based on the visualization
-    - cached: Whether this explanation was retrieved from cache
-    
-    The explanation generation:
-    - Runs synchronously (fast with caching)
-    - Fails safely: If LLM unavailable, returns graceful fallback
-    - Caches by hash of dataset + chart_type + x + y
-    """
-    try:
-        # Create metadata object
-        metadata = VisualizationMetadata(
-            chart_type=request.chart_type,
-            x=request.x,
-            y=request.y,
-            dataset=request.dataset,
-            correlation=request.correlation,
-        )
-        
-        # Get environment variables for LLM
-        model = os.getenv("OLLAMA_PHASE3_MODEL", "llama3.2:3b")
-        ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-        
-        # Run explanation generation (async in background would be better, but
-        # we use sync here with caching to keep it fast)
-        explanation = _generate_explanation_sync(
-            metadata=metadata,
-            model=model,
-            host=ollama_host,
-        )
-        
-        return ChartExplanationResponse(
-            summary=explanation.summary,
-            insight=explanation.insight,
-            interpretation=explanation.interpretation,
-            suggestion=explanation.suggestion,
-            cached=False,  # We could track this more precisely with cache stats
-        )
-    
-    except Exception as e:
-        print(f"[api] Error generating chart explanation: {e}", flush=True)
-        # Return graceful fallback if explanation generation fails
-        return ChartExplanationResponse(
-            summary="Chart visualization",
-            insight="Unable to generate explanation",
-            interpretation="Please analyze the chart manually",
-            suggestion="Review the data and visualization parameters",
-            cached=False,
-        )
-
-
-@app.post("/runs/{run_id}/charts/explain")
-async def explain_run_chart(
-    run_id: str,
-    request: ChartExplanationRequest,
-) -> ChartExplanationResponse:
-    """
-    Generate an AI explanation for a chart in the context of a specific run.
-    
-    Same as POST /charts/explain but includes run context validation.
-    Useful for explaining charts generated within a pipeline run.
-    """
-    # Validate run exists
-    state = get_run(run_id)
-    if not state:
-        return JSONResponse(
-            status_code=404,
-            content={"error": f"Run {run_id} not found"},
-        )
-    
-    # Delegate to main explanation endpoint
-    return await explain_chart(request)
 
 
 @app.get("/health")
@@ -1060,9 +895,8 @@ async def root():
                 "GET /runs/{run_id}/report": "Get markdown report",
                 "GET /runs/{run_id}/validation": "Get validation_result.json",
                 "GET /runs/{run_id}/stats": "Get descriptive stats for cleaned CSV",
+                "GET /runs/{run_id}/chart-explanations": "Get per-chart explanations JSON",
                 "POST /runs/{run_id}/charts/custom": "Generate custom chart from instruction",
-                "POST /charts/explain": "Generate AI explanation for a chart",
-                "POST /runs/{run_id}/charts/explain": "Generate AI explanation for a run's chart",
                 "GET /health": "Health check",
             },
         }
@@ -1071,7 +905,7 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    
+
     uvicorn.run(
         app,
         host="127.0.0.1",
