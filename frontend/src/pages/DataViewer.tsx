@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { usePipeline } from "@/context/PipelineContext";
 import { downloadCSV } from "@/lib/api";
 import { useToast } from "@/hooks/use-toast";
+import { FeedbackWidget, FeedbackSummary } from "@/components/FeedbackWidget";
 
 const DataViewer = () => {
   const { csvData, isLoading, runId } = usePipeline();
@@ -15,9 +16,35 @@ const DataViewer = () => {
   const [sortBy, setSortBy] = useState("none");
   const [sortOrder, setSortOrder] = useState("ascending");
   const [visibleColumns, setVisibleColumns] = useState<string[]>([]);
+  const [datasetHash, setDatasetHash] = useState("");
+  const [features, setFeatures] = useState<number[]>([]);
 
   const rows = csvData || [];
   const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
+
+  // Fetch features and hash from API when run completes
+  useEffect(() => {
+    if (runId) {
+      // Fetch cached features from backend  
+      fetch(`/api/features/${runId}`)
+        .then(r => r.json())
+        .then(data => {
+          if (data.features && data.features.length === 8) {
+            setFeatures(data.features);
+            console.log("[DataViewer] Features loaded:", data.features);
+          }
+          if (data.dataset_hash) {
+            setDatasetHash(data.dataset_hash);
+            console.log("[DataViewer] Hash set from backend:", data.dataset_hash);
+          }
+        })
+        .catch(e => {
+          console.warn("[DataViewer] Could not fetch features:", e);
+          // Fallback: use runId as hash for consistency
+          setDatasetHash(`run_${runId}`);
+        });
+    }
+  }, [runId]);
 
   // Update visible columns when data loads
   useEffect(() => {
@@ -237,22 +264,34 @@ const DataViewer = () => {
 
       {/* Stats Cards */}
       {rows.length > 0 && (
-        <div className="grid grid-cols-4 gap-4 border-b px-6 py-4">
-          <div className="rounded-lg border bg-card p-4">
-            <p className="font-body text-sm text-muted-foreground">Total Rows</p>
-            <p className="font-display text-3xl font-bold text-foreground">{stats.totalRows.toLocaleString()}</p>
+        <div>
+          <div className="grid grid-cols-4 gap-4 border-b px-6 py-4">
+            <div className="rounded-lg border bg-card p-4">
+              <p className="font-body text-sm text-muted-foreground">Total Rows</p>
+              <p className="font-display text-3xl font-bold text-foreground">{stats.totalRows.toLocaleString()}</p>
+            </div>
+            <div className="rounded-lg border bg-card p-4">
+              <p className="font-body text-sm text-muted-foreground">Total Columns</p>
+              <p className="font-display text-3xl font-bold text-foreground">{stats.totalCols}</p>
+            </div>
+            <div className="rounded-lg border bg-card p-4">
+              <p className="font-body text-sm text-muted-foreground">Complete Columns</p>
+              <p className="font-display text-3xl font-bold text-green-500">{stats.completeCols}</p>
+            </div>
+            <div className="rounded-lg border bg-card p-4">
+              <p className="font-body text-sm text-muted-foreground">Data Quality</p>
+              <p className="font-display text-3xl font-bold text-blue-500">{stats.avgQuality.toFixed(1)}%</p>
+            </div>
           </div>
-          <div className="rounded-lg border bg-card p-4">
-            <p className="font-body text-sm text-muted-foreground">Total Columns</p>
-            <p className="font-display text-3xl font-bold text-foreground">{stats.totalCols}</p>
-          </div>
-          <div className="rounded-lg border bg-card p-4">
-            <p className="font-body text-sm text-muted-foreground">Complete Columns</p>
-            <p className="font-display text-3xl font-bold text-green-500">{stats.completeCols}</p>
-          </div>
-          <div className="rounded-lg border bg-card p-4">
-            <p className="font-body text-sm text-muted-foreground">Data Quality</p>
-            <p className="font-display text-3xl font-bold text-blue-500">{stats.avgQuality.toFixed(1)}%</p>
+
+          {/* Feedback Widget & Summary */}
+          <div className="px-6 py-4 border-b">
+            <FeedbackWidget
+              datasetHash={datasetHash}
+              predictedScore={stats.avgQuality}
+              features={features}
+            />
+            <FeedbackSummary />
           </div>
         </div>
       )}

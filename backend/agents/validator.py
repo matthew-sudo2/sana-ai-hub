@@ -22,12 +22,15 @@ try:
         sys.path.insert(0, str(_utils_path.parent))
         from utils.ml_quality_scorer import MLQualityScorer
         from utils.ml_assessment_viz import MLAssessmentVisualizer
+        from utils.feature_cache import FeatureCache
         _ML_SCORER = MLQualityScorer()
     else:
         _ML_SCORER = None
         MLAssessmentVisualizer = None
+        FeatureCache = None
 except Exception as e:
     _ML_SCORER = None
+    FeatureCache = None
     MLAssessmentVisualizer = None
 
 
@@ -338,7 +341,7 @@ def _check_outliers(df: pd.DataFrame) -> list[CheckResult]:
     return checks
 
 
-def _check_ml_quality(df: pd.DataFrame) -> list[CheckResult]:
+def _check_ml_quality(df: pd.DataFrame, run_dir: Path | None = None) -> list[CheckResult]:
     """
     ML-based data quality assessment using trained Random Forest model.
     Evaluates overall data quality as GOOD or BAD.
@@ -361,6 +364,18 @@ def _check_ml_quality(df: pd.DataFrame) -> list[CheckResult]:
         score_result = _ML_SCORER.score(df)
         quality = score_result["quality"]  # "GOOD" or "BAD"
         confidence = score_result["score"]  # 0-100
+        
+        # Save extracted features to cache for feedback loop
+        if run_dir and FeatureCache and score_result.get("features") is not None:
+            try:
+                dataset_hash = FeatureCache.get_dataset_hash(str(run_dir / "cleaned_data.csv"))
+                FeatureCache.save_features(
+                    run_dir=str(run_dir),
+                    features=score_result.get("features", []),
+                    dataset_hash=dataset_hash
+                )
+            except Exception as e:
+                print(f"[validator] Warning: Failed to cache features: {e}")
         
         # Stricter interpretation: Only pass if GOOD quality with sufficient confidence (>70%)
         # If BAD, always fail. If GOOD but low confidence, flag as warning
@@ -634,7 +649,7 @@ def run_validation(
         checks += _check_sanity(df, analysis)
         checks += _check_consistency(df, analysis)
         checks += _check_outliers(df)
-        checks += _check_ml_quality(df)
+        checks += _check_ml_quality(df, run_dir)
     checks += _check_visualizations(viz_summary)
 
     # 5-metric framework: Completeness, Consistency, Accuracy, Duplicates, Outliers + ML Assessment

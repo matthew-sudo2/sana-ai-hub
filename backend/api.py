@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -23,14 +24,14 @@ import seaborn as sns
 from fastapi import UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 # Load environment variables from backend/.env (not root)
 _ENV_PATH = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=_ENV_PATH)
 
-from .graph import create_run, get_run, execute_run, PipelineState
+from .graph import create_run, get_run, execute_run, PipelineState, _RUNS
 from .agents.analyst import (
     _generate_visualization_explanation,
     _load_cached_explanation,
@@ -38,6 +39,9 @@ from .agents.analyst import (
     VisualizationExplanation,
 )
 from .utils.ml_quality_scorer import MLQualityScorer
+from .utils.feedback_db import FeedbackDB
+from .utils.feature_cache import FeatureCache
+from .utils.continuous_learner import ContinuousLearner
 
 
 
@@ -99,6 +103,29 @@ class QualityCheckResponse(BaseModel):
     ml_assessment: MLQualityAssessment
     validation_status: str
     confidence: float
+
+
+class FeedbackRequest(BaseModel):
+    dataset_hash: str
+    predicted_score: float
+    actual_quality: int = Field(ge=0, le=3)  # Only allow 0-3 (poor to excellent)
+    features: list[float] | None = None
+
+
+class FeedbackResponse(BaseModel):
+    status: str  # "stored" or "retrained"
+    feedback_count: int
+    cv_score: float | None = None
+    next_retrain_at: int | None = None
+    message: str | None = None
+
+
+class FeedbackStatsResponse(BaseModel):
+    total_feedbacks: int
+    models_trained: int
+    current_cv_score: float | None
+    latest_retrain_at: str | None
+    improvement_percentage: float | None
 
 
 # ============================================================================
@@ -1284,6 +1311,304 @@ async def get_chart_explanation(
         )
 
 
+# ============================================================================
+# Continuous Learning Feedback Loop
+# ============================================================================
+
+@app.post("/api/feedback")
+async def record_feedback(request: FeedbackRequest) -> FeedbackResponse:
+    """
+    Record user feedback for continuous model improvement.
+    
+    User provides feedback on whether the quality score was accurate.
+    Features are extracted during validation and stored for retraining.
+    
+    Auto-retrains every 20 feedback samples.
+    
+    Args:
+        dataset_hash: MD5 hash of the dataset (for deduplication)
+        predicted_score: Model's quality prediction (0-100)
+        actual_quality: User feedback (0=poor, 1=fair, 2=good, 3=excellent)
+        features: List of 8 extracted features (optional, can be fetched from cache)
+    
+    Returns:
+        FeedbackResponse with status and next retrain count
+    """
+    try:
+        feedback_db = FeedbackDB()
+        
+        # Store feedback
+        feedback_db.save(
+            dataset_hash=request.dataset_hash,
+            predicted_score=request.predicted_score,
+            actual_label=request.actual_quality,
+            features=request.features or []
+        )
+        
+        count = feedback_db.count()
+        
+        # Check if it's time to retrain: after 1st feedback, then every 5 feedbacks
+        should_retrain = (count == 1) or (count >= 5 and count % 5 == 0)
+        
+        if should_retrain:
+            print(f"\n[API] Feedback count: {count} - triggering auto-retrain...")
+            
+            try:
+                learner = ContinuousLearner()
+                result = learner.retrain()
+                
+                if result["success"]:
+                    # Clean old feedback records after successful retrain (keep last 100)
+                    deleted = feedback_db.clear_feedback(keep_last=100)
+                    if deleted > 0:
+                        print(f"[API] Cleaned {deleted} old feedback records after retrain")
+                    
+                    return FeedbackResponse(
+                        status="retrained",
+                        feedback_count=count,
+                        cv_score=result["cv_score"],
+                        message=f"✓ Model retrained! CV Score: {result['cv_score']:.1%} on {result['total_samples']} samples"
+                    )
+                else:
+                    next_retrain = 5 if count == 1 else (5 - (count % 5))
+                    return FeedbackResponse(
+                        status="stored",
+                        feedback_count=count,
+                        message=f"Feedback stored, but retrain failed: {result.get('error', 'Unknown error')}. Next retrain in {next_retrain} feedbacks.",
+                        next_retrain_at=next_retrain
+                    )
+            except Exception as e:
+                print(f"[API] Retrain error: {e}")
+                next_retrain = 5 if count == 1 else (5 - (count % 5))
+                return FeedbackResponse(
+                    status="stored",
+                    feedback_count=count,
+                    message=f"Feedback stored. Retrain failed: {str(e)}",
+                    next_retrain_at=next_retrain
+                )
+        
+        # Not time to retrain yet - calculate feedbacks remaining
+        if count == 0:
+            next_retrain = 1
+        elif count == 1:
+            next_retrain = 4  # Next retrain at count=5
+        else:
+            next_retrain = 5 - (count % 5)
+        
+        return FeedbackResponse(
+            status="stored",
+            feedback_count=count,
+            next_retrain_at=next_retrain,
+            message=f"✓ Feedback stored. {next_retrain} more feedbacks until next retrain."
+        )
+    
+    except Exception as e:
+        print(f"[API] Feedback error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to store feedback: {str(e)}"}
+        )
+
+
+@app.get("/api/feedback/stats")
+async def get_feedback_stats() -> FeedbackStatsResponse:
+    """
+    Get feedback loop statistics and model improvement metrics.
+    
+    Returns:
+        FeedbackStatsResponse with:
+        - total_feedbacks: Number of feedback records
+        - models_trained: Number of retraining events  
+        - current_cv_score: Latest model's cross-val score
+        - latest_retrain_at: Timestamp of last retrain
+        - improvement_percentage: Score improvement (if multiple retrains)
+    """
+    try:
+        feedback_db = FeedbackDB()
+        learner = ContinuousLearner()
+        
+        total_feedbacks = feedback_db.count()
+        history = learner.get_model_history(max_records=10)
+        
+        models_trained = len(history)
+        current_cv_score = None
+        latest_retrain_at = None
+        improvement_percentage = None
+        
+        if history:
+            latest = history[-1]
+            current_cv_score = latest.get("cv_score", 0.0)
+            latest_retrain_at = latest.get("timestamp")
+            
+            # Calculate improvement if we have history
+            if len(history) > 1:
+                first = history[0]
+                first_score = first.get("cv_score", 0.0)
+                improvement_percentage = ((current_cv_score - first_score) / first_score * 100) if first_score > 0 else None
+        
+        return FeedbackStatsResponse(
+            total_feedbacks=total_feedbacks,
+            models_trained=models_trained,
+            current_cv_score=current_cv_score,
+            latest_retrain_at=latest_retrain_at,
+            improvement_percentage=improvement_percentage
+        )
+    
+    except Exception as e:
+        print(f"[API] Stats error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to get feedback stats: {str(e)}"}
+        )
+
+
+@app.get("/api/features/{run_id}")
+async def get_cached_features(run_id: str) -> dict:
+    """
+    Retrieve cached ML features for a specific run.
+    
+    Features are extracted by MLQualityScorer during validation.
+    Returns the 8 statistical features needed for feedback retraining.
+    
+    Args:
+        run_id: The pipeline run ID
+    
+    Returns:
+        dict with:
+        - features: List of 8 floats [missing_ratio, duplicate_ratio, numeric_ratio, ...]
+        - dataset_hash: MD5 hash of the cleaned CSV
+        - feature_names: Names of the 8 features
+        - error: Error message if features not found
+    """
+    try:
+        # Get run metadata
+        run_data = _RUNS.get(run_id, {})
+        if not run_data:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Run not found", "features": [], "dataset_hash": ""}
+            )
+        
+        # Get output directory path
+        output_dir = run_data.get("output_dir")
+        if not output_dir:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Output directory not found", "features": [], "dataset_hash": ""}
+            )
+        
+        # Check for cached features file
+        features_file = Path(output_dir) / "features.json"
+        if not features_file.exists():
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Features not cached for this run", "features": [], "dataset_hash": ""}
+            )
+        
+        # Load features
+        features_data = json.loads(features_file.read_text())
+        return {
+            "features": features_data.get("features", []),
+            "dataset_hash": features_data.get("dataset_hash", ""),
+            "feature_names": features_data.get("feature_names", [])
+        }
+        
+    except Exception as e:
+        print(f"[api] Error retrieving features: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "features": [], "dataset_hash": ""}
+        )
+
+
+@app.post("/api/data-hash")
+async def compute_data_hash(file: UploadFile = File(...)) -> dict:
+    """
+    Compute MD5 hash of uploaded dataset for deduplication.
+    
+    Used to ensure consistent hashing between frontend and backend.
+    Same dataset always produces same hash.
+    
+    Args:
+        file: CSV file to hash
+    
+    Returns:
+        dict with:
+        - hash: MD5 hash of file contents (hex string)
+        - filename: Original filename
+    
+    Example:
+        POST /api/data-hash
+        file: (binary CSV data)
+        
+        Returns:
+        {
+          "hash": "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
+          "filename": "data.csv"
+        }
+    """
+    try:
+        contents = await file.read()
+        data_hash = hashlib.md5(contents).hexdigest()
+        return {
+            "hash": data_hash,
+            "filename": file.filename
+        }
+    except Exception as e:
+        print(f"[api] Hash computation error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@app.get("/api/feedback/health")
+async def feedback_db_health() -> dict:
+    """
+    Check feedback database integrity and health.
+    
+    Returns:
+        dict with:
+        - total_feedbacks: Total records
+        - valid_with_features: Records with valid 8-feature arrays
+        - invalid_empty_features: Records with missing/invalid features
+        - health_percentage: Percentage of valid records
+        - status: "healthy" | "degraded" | "poor" | "no_data"
+    """
+    try:
+        feedback_db = FeedbackDB()
+        total = feedback_db.count()
+        
+        if total == 0:
+            return {
+                "total_feedbacks": 0,
+                "valid_with_features": 0,
+                "invalid_empty_features": 0,
+                "health_percentage": 100.0,
+                "status": "no_data"
+            }
+        
+        # Count valid records
+        valid_features, valid_labels = feedback_db.get_feedback_for_retraining()
+        valid_count = len(valid_features)
+        invalid_count = total - valid_count
+        health = (valid_count / total * 100) if total > 0 else 0
+        
+        return {
+            "total_feedbacks": total,
+            "valid_with_features": valid_count,
+            "invalid_empty_features": invalid_count,
+            "health_percentage": round(health, 1),
+            "status": "healthy" if health > 90 else "degraded" if health > 70 else "poor"
+        }
+    except Exception as e:
+        print(f"[api] Feedback health check error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
@@ -1309,6 +1634,11 @@ async def root():
                 "GET /runs/{run_id}/chart-explanations": "Get per-chart explanations JSON",
                 "POST /runs/{run_id}/charts/custom": "Generate custom chart from instruction",
                 "GET /runs/{run_id}/charts/{chart_type}/explanation": "Get AI-generated explanation for chart (query: x, y, dataset)",
+                "POST /api/feedback": "Record feedback on ML quality prediction (0-3 rating). Triggers auto-retrain every 5 feedbacks",
+                "GET /api/feedback/stats": "Get feedback statistics: total feedbacks, models trained, improvement %",
+                "GET /api/feedback/health": "Check feedback database integrity and data quality",
+                "GET /api/features/{run_id}": "Retrieve cached ML features from a run (for feedback submission)",
+                "POST /api/data-hash": "Compute MD5 hash of dataset for consistent deduplication",
                 "GET /health": "Health check",
             },
         }

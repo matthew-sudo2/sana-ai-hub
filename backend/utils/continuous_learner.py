@@ -1,0 +1,325 @@
+"""
+Continuous Learning: Model Retraining with Accumulated Feedback
+Automatically retrains RandomForest when enough feedback is collected.
+"""
+
+import numpy as np
+import json
+import pickle
+import shutil
+from pathlib import Path
+from datetime import datetime
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import cross_val_score
+from typing import Dict, Any
+
+from .feedback_db import FeedbackDB
+
+
+class ContinuousLearner:
+    """Retrain ML quality model with accumulated user feedback."""
+    
+    def __init__(
+        self,
+        model_dir: str = "models",
+        synthetic_data_dir: str = "data/synthetic"
+    ):
+        """
+        Initialize continuous learner.
+        
+        Args:
+            model_dir: Directory containing model artifacts
+            synthetic_data_dir: Directory containing original training features
+        """
+        self.model_dir = Path(model_dir)
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        self.synthetic_data_dir = Path(synthetic_data_dir)
+        self.feedback_db = FeedbackDB()
+        self.model_path = self.model_dir / "best_model.pkl"
+        self.metrics_path = self.model_dir / "model_metrics.jsonl"
+    
+    def _load_training_features(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Load original training features from synthetic data directory.
+        
+        Returns:
+            Tuple of (X_original, y_original) feature arrays
+        """
+        try:
+            good_features = np.load(
+                self.synthetic_data_dir / "good_quality_features_real.npy"
+            )
+            bad_features = np.load(
+                self.synthetic_data_dir / "bad_quality_features_real.npy"
+            )
+            
+            X = np.vstack([good_features, bad_features])
+            y = np.hstack([
+                np.ones(len(good_features)),
+                np.zeros(len(bad_features))
+            ])
+            
+            print(f"[Learner] Loaded original training data: {X.shape}")
+            return X, y
+        except FileNotFoundError as e:
+            print(f"✗ Could not load training features: {e}")
+            raise
+    
+    def _get_feedback_data(self) -> tuple[list, list]:
+        """
+        Get accumulated feedback features and labels.
+        
+        Returns:
+            Tuple of (features_list, labels_list)
+        """
+        features_list, labels_list = self.feedback_db.get_feedback_for_retraining()
+        
+        if features_list:
+            print(f"[Learner] Loaded {len(features_list)} feedback samples")
+        
+        return features_list, labels_list
+    
+    def _validate_model(self, model: RandomForestClassifier, X: np.ndarray, y: np.ndarray) -> float:
+        """
+        Perform K-fold cross-validation on the model.
+        
+        Args:
+            model: Unfitted RandomForestClassifier
+            X: Feature array
+            y: Label array
+        
+        Returns:
+            Mean cross-validation score (0-1)
+        """
+        try:
+            # Use balanced_accuracy for potentially imbalanced datasets
+            n_splits = min(5, len(np.unique(y)))
+            cv_scores = cross_val_score(
+                model,
+                X, y,
+                cv=n_splits,
+                scoring='balanced_accuracy'
+            )
+            mean_score = cv_scores.mean()
+            print(f"[Learner] K-fold CV ({n_splits}-fold): {mean_score:.3f} (std: {cv_scores.std():.3f})")
+            return mean_score
+        except Exception as e:
+            print(f"✗ Cross-validation failed: {e}")
+            return 0.0
+    
+    def _backup_old_model(self) -> Path:
+        """
+        Backup current model with timestamp.
+        
+        Returns:
+            Path to backup file
+        """
+        if not self.model_path.exists():
+            return None
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = self.model_dir / f"best_model_bak_{timestamp}.pkl"
+        
+        try:
+            shutil.copy(self.model_path, backup_path)
+            print(f"[Learner] ✓ Backed up old model → {backup_path.name}")
+            return backup_path
+        except Exception as e:
+            print(f"✗ Backup failed: {e}")
+            return None
+    
+    def _save_model(self, model: RandomForestClassifier) -> bool:
+        """
+        Save trained model to disk.
+        
+        Args:
+            model: Trained RandomForestClassifier
+        
+        Returns:
+            True if successful
+        """
+        try:
+            self.model_dir.mkdir(parents=True, exist_ok=True)
+            
+            with open(self.model_path, "wb") as f:
+                pickle.dump(model, f)
+            
+            print(f"[Learner] ✓ Model saved to {self.model_path}")
+            return True
+        except Exception as e:
+            print(f"✗ Model save failed: {e}")
+            return False
+    
+    def _log_metrics(self, cv_score: float, feedback_count: int, total_samples: int) -> bool:
+        """
+        Log retraining metrics to JSONL file (append-only).
+        
+        Args:
+            cv_score: Cross-validation accuracy
+            feedback_count: Number of feedback samples used
+            total_samples: Total training samples after combining
+        
+        Returns:
+            True if successful
+        """
+        try:
+            self.model_dir.mkdir(parents=True, exist_ok=True)
+            
+            metrics = {
+                "timestamp": datetime.now().isoformat(),
+                "cv_score": float(cv_score),
+                "feedback_samples": feedback_count,
+                "total_training_samples": total_samples,
+                "model_type": "RandomForestClassifier",
+                "action": "retrain"
+            }
+            
+            with open(self.metrics_path, "a") as f:
+                f.write(json.dumps(metrics) + "\n")
+            
+            print(f"[Learner] ✓ Metrics logged")
+            return True
+        except Exception as e:
+            print(f"✗ Metrics logging failed: {e}")
+            return False
+    
+    def retrain(self) -> Dict[str, Any]:
+        """
+        Retrain RandomForest model with accumulated feedback.
+        
+        Returns:
+            Dictionary with retraining results:
+            {
+                "success": bool,
+                "cv_score": float,
+                "feedback_count": int,
+                "total_samples": int,
+                "error": str (if failed)
+            }
+        """
+        print("\n" + "="*70)
+        print("CONTINUOUS LEARNING: MODEL RETRAINING")
+        print("="*70)
+        
+        try:
+            # Step 1: Load original training data
+            print("\n[Step 1] Loading original training data...")
+            X_orig, y_orig = self._load_training_features()
+            
+            # Step 2: Load feedback data
+            print("\n[Step 2] Loading accumulated feedback...")
+            X_feedback, y_feedback = self._get_feedback_data()
+            
+            if not X_feedback:
+                print("✗ No feedback data to retrain on. Skipping retrain.")
+                return {
+                    "success": False,
+                    "error": "No feedback data available",
+                    "cv_score": 0.0,
+                    "feedback_count": 0,
+                    "total_samples": len(X_orig)
+                }
+            
+            # Step 3: Combine datasets
+            print("\n[Step 3] Combining original + feedback data...")
+            X = np.vstack([X_orig, np.array(X_feedback)])
+            y = np.hstack([y_orig, np.array(y_feedback)])
+            print(f"[Learner] Combined: {len(X_orig)} original + {len(X_feedback)} feedback = {len(X)} total")
+            
+            # Step 4: Create and validate model
+            print("\n[Step 4] Training new RandomForest...")
+            model = RandomForestClassifier(
+                n_estimators=100,
+                max_depth=15,
+                min_samples_split=5,
+                min_samples_leaf=2,
+                random_state=42,
+                class_weight='balanced',
+                n_jobs=-1
+            )
+            
+            # Validate before saving
+            print("\n[Step 5] Validating with K-fold cross-validation...")
+            cv_score = self._validate_model(model, X, y)
+            
+            # Step 6: Train final model
+            print("\n[Step 6] Training final model...")
+            model.fit(X, y)
+            print(f"[Learner] ✓ Model trained on {len(X)} samples")
+            
+            # Step 7: Backup and save
+            print("\n[Step 7] Backup & deployment...")
+            self._backup_old_model()
+            
+            if not self._save_model(model):
+                raise Exception("Failed to save model")
+            
+            # Step 8: Log metrics
+            print("\n[Step 8] Logging metrics...")
+            self._log_metrics(cv_score, len(X_feedback), len(X))
+            
+            print("\n" + "="*70)
+            print("✓ RETRAINING COMPLETE")
+            print(f"  CV Score: {cv_score:.1%}")
+            print(f"  Feedback Samples: {len(X_feedback)}")
+            print(f"  Total Training Samples: {len(X)}")
+            print("="*70 + "\n")
+            
+            return {
+                "success": True,
+                "cv_score": float(cv_score),
+                "feedback_count": len(X_feedback),
+                "total_samples": len(X)
+            }
+        
+        except Exception as e:
+            print(f"\n✗ RETRAINING FAILED: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "cv_score": 0.0,
+                "feedback_count": 0,
+                "total_samples": 0
+            }
+    
+    def get_model_history(self, max_records: int = 10) -> list:
+        """
+        Get recent retraining history.
+        
+        Args:
+            max_records: Maximum number of recent records to return
+        
+        Returns:
+            List of dictionaries with retraining metrics
+        """
+        if not self.metrics_path.exists():
+            return []
+        
+        try:
+            metrics = []
+            with open(self.metrics_path, "r") as f:
+                for line in f:
+                    try:
+                        metrics.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+            
+            return metrics[-max_records:]
+        except Exception as e:
+            print(f"✗ Error reading model history: {e}")
+            return []
+
+
+# Standalone function for easy CLI usage
+def retrain_model() -> Dict[str, Any]:
+    """Convenience function to retrain model from command line."""
+    learner = ContinuousLearner()
+    return learner.retrain()
+
+
+if __name__ == "__main__":
+    result = retrain_model()
+    if result["success"]:
+        print(f"\n✓ Retraining successful! CV Score: {result['cv_score']:.1%}")
+    else:
+        print(f"\n✗ Retraining failed: {result.get('error', 'Unknown error')}")

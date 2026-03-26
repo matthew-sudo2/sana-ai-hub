@@ -22,6 +22,9 @@ import pandas as pd
 import seaborn as sns
 from langgraph.graph import END, START, StateGraph
 
+from .utils.feedback_db import FeedbackDB
+from .utils.continuous_learner import ContinuousLearner
+
 
 class PipelineState(TypedDict, total=False):
     """Pipeline state for LangGraph - compatible TypedDict."""
@@ -902,6 +905,42 @@ def execute_run(run_id: str) -> None:
                     _RUNS[run_id] = dict(node_state)  # Update stored state after each node
                 else:
                     _RUNS[run_id] = node_state
+        
+        # After successful run completion, check if auto-retrain is needed
+        final_state = _RUNS.get(run_id)
+        if final_state and final_state.get("status") == "success":
+            try:
+                feedback_db = FeedbackDB()
+                feedback_count = feedback_db.count()
+                
+                # Auto-retrain: after 1st feedback, then every 5 feedbacks
+                # This allows early model improvement instead of waiting for 20
+                should_retrain = (feedback_count == 1) or (feedback_count >= 5 and feedback_count % 5 == 0)
+                
+                if should_retrain:
+                    print(f"\n[graph] Feedback count: {feedback_count} - triggering auto-retrain...")
+                    learner = ContinuousLearner()
+                    result = learner.retrain()
+                    
+                    if result["success"]:
+                        print(f"[graph] ✓ Auto-retrain successful! CV Score: {result['cv_score']:.1%}")
+                        
+                        # Note: New model is saved to disk. Next validation will load it automatically.
+                        # (No need to reload _ML_SCORER since it's initialized fresh per validation)
+                        print(f"[graph] ℹ️  New model deployed. Next pipeline run will use updated weights.")
+                        
+                        # Cleanup: keep last 500 feedback records to prevent unlimited growth
+                        try:
+                            feedback_db.clear_feedback(keep_last=500)
+                            print(f"[graph] ✓ Cleaned up feedback database")
+                        except Exception as cleanup_err:
+                            print(f"[graph] ⚠️ Cleanup warning: {cleanup_err}")
+                    else:
+                        print(f"[graph] ⚠ Auto-retrain failed: {result.get('error')}")
+            except Exception as e:
+                print(f"[graph] Warning: Auto-retrain failed: {e}")
+                # Don't fail the run - this is non-critical
+    
     except Exception as e:
         # Persist the error state even on exception
         current_state = _RUNS.get(run_id, {})

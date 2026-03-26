@@ -31,6 +31,15 @@ class MLQualityScorer:
         with open(self.model_path, "rb") as f:
             self.model = pickle.load(f)
     
+    def reload_model(self):
+        """
+        Reload model from disk (call after retraining).
+        Used to pick up newly trained models without restarting.
+        """
+        print("[Scorer] Reloading model from disk...")
+        self._load_model()
+        print("[Scorer] ✓ Model reloaded successfully")
+    
     @staticmethod
     def extract_features(df: pd.DataFrame) -> list[float]:
         """
