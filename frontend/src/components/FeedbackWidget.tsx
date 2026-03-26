@@ -1,12 +1,12 @@
-/**
+﻿/**
  * FeedbackWidget - User feedback component for quality score accuracy verification
  * Shows buttons to collect feedback on whether model's quality score was accurate
  */
 
 import { useState, useEffect } from "react";
 import { useFeedback } from "../hooks/useFeedback";
-import { QUALITY_LABELS, QUALITY_COLORS } from "../types/feedback";
-import type { FeedbackResponse, FeedbackWidgetProps } from "../types/feedback";
+import { usePipeline } from "../context/PipelineContext";
+import type { FeedbackResponse, FeedbackWidgetProps } from "../types/feedback"; 
 
 export const FeedbackWidget = ({
   datasetHash,
@@ -14,14 +14,43 @@ export const FeedbackWidget = ({
   features = [],
   onFeedbackSubmitted,
 }: FeedbackWidgetProps) => {
+  const { runId } = usePipeline();
   const { submitFeedback, isLoading, error } = useFeedback();
   const [hasSubmitted, setHasSubmitted] = useState(false);
   const [response, setResponse] = useState<FeedbackResponse | null>(null);
-  const [selectedLabel, setSelectedLabel] = useState<number | null>(null);
+
+  // Create a persistent key that survives tab switches
+  // Use runId as primary key (persists across component remounts)
+  // Fall back to datasetHash if runId not available
+  const storageKey = runId ? `feedback_run_${runId}` : (datasetHash ? `feedback_${datasetHash}` : null);
+
+  // Restore feedback state from localStorage when storage key changes
+  useEffect(() => {
+    if (storageKey) {
+      try {
+        const stored = localStorage.getItem(storageKey);
+        if (stored) {
+          const data = JSON.parse(stored);
+          setResponse(data.response);
+          setHasSubmitted(true);
+        } else {
+          // Reset state if no stored feedback for this key
+          setResponse(null);
+          setHasSubmitted(false);
+        }
+      } catch (e) {
+        // Silently ignore localStorage errors - reset state
+        setResponse(null);
+        setHasSubmitted(false);
+      }
+    } else {
+      // Reset if no storage key available
+      setResponse(null);
+      setHasSubmitted(false);
+    }
+  }, [storageKey]);
 
   const handleSubmit = async (label: number) => {
-    setSelectedLabel(label);
-    
     const feedbackRequest = {
       dataset_hash: datasetHash,
       predicted_score: predictedScore,
@@ -30,39 +59,26 @@ export const FeedbackWidget = ({
     };
 
     const result = await submitFeedback(feedbackRequest);
-
-    if (result) {
+    if (result && storageKey) {
       setResponse(result);
       setHasSubmitted(true);
+      // Persist to localStorage using runId key (survives tab switches)
+      localStorage.setItem(storageKey, JSON.stringify({
+        timestamp: new Date().toISOString(),
+        response: result,
+      }));
       onFeedbackSubmitted?.(result);
     }
   };
 
   if (hasSubmitted && response) {
     return (
-      <div className="mt-6 p-4 rounded-lg bg-green-50 border border-green-200">
+      <div className="mt-4 p-4 rounded-lg bg-emerald-500/10 border border-emerald-500/30"> 
         <div className="flex items-start gap-3">
-          <div className="text-2xl">✓</div>
+          <div className="text-emerald-600 font-bold mt-1">✓</div>
           <div className="flex-1">
-            <h3 className="font-semibold text-green-900">Thank you for your feedback!</h3>
-            <p className="text-sm text-green-800 mt-1">{response.message}</p>
-            
-            {response.status === "retrained" && (
-              <div className="mt-3 p-2 rounded bg-green-100 border border-green-300">
-                <p className="text-sm font-medium text-green-900">
-                  🚀 Model Retrained Successfully!
-                </p>
-                <p className="text-xs text-green-800 mt-1">
-                  Cross-validation Score: <span className="font-mono">{response.cv_score ? (response.cv_score * 100).toFixed(1) : 'N/A'}%</span>
-                </p>
-              </div>
-            )}
-            
-            {response.status === "stored" && response.next_retrain_at && (
-              <div className="mt-2 text-xs text-gray-600">
-                Next retrain in {response.next_retrain_at} more feedbacks
-              </div>
-            )}
+            <h3 className="font-display font-semibold text-emerald-800 dark:text-emerald-400 text-sm">Thank you for your feedback!</h3>
+            <p className="font-body text-xs text-emerald-700 dark:text-emerald-500 mt-1">Your response has been recorded and will help improve our assessments.</p>   
           </div>
         </div>
       </div>
@@ -70,126 +86,61 @@ export const FeedbackWidget = ({
   }
 
   return (
-    <div className="mt-6 p-4 rounded-lg bg-gray-900 border border-gray-700">
+    <div className="mt-4 p-5 rounded-lg border bg-card shadow-sm">
       {error && (
-        <div className="mb-4 p-3 rounded bg-red-900 border border-red-700">
-          <p className="text-xs text-red-200">⚠️ Error: {error}</p>
+        <div className="mb-4 p-3 rounded-md bg-destructive/10 border border-destructive/20">     
+          <p className="text-xs text-destructive">⚠️ Error: {error}</p>
         </div>
       )}
-      <div className="mb-4">
-        <h3 className="text-sm font-semibold text-white mb-2">
-          How accurate was this quality score?
-        </h3>
-        <p className="text-xs text-gray-400">
-          Your feedback helps us improve the model's accuracy
-        </p>
+      <div className="mb-4 flex items-center justify-between">
+        <div>
+          <h3 className="font-display text-sm font-semibold text-foreground flex items-center gap-2">
+            <span className="text-amber-500 text-base">⭐</span>
+            How accurate was this quality score?
+          </h3>
+          <p className="font-body text-xs text-muted-foreground mt-1">
+            Your feedback helps us improve the model's accuracy and future predictions
+          </p>
+        </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-2">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <button
           onClick={() => handleSubmit(3)}
           disabled={isLoading}
-          className="p-2 rounded bg-green-600 hover:bg-green-700 disabled:opacity-50 transition text-white text-sm font-medium"
+          className="flex items-center justify-center gap-2 py-2.5 px-3 rounded-md border border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 font-medium text-xs transition-colors hover:bg-emerald-500/20 disabled:opacity-50"
         >
-          ✓ Perfect
+          <span>✓</span> Perfect
         </button>
         <button
           onClick={() => handleSubmit(2)}
           disabled={isLoading}
-          className="p-2 rounded bg-blue-600 hover:bg-blue-700 disabled:opacity-50 transition text-white text-sm font-medium"
+          className="flex items-center justify-center gap-2 py-2.5 px-3 rounded-md border border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-400 font-medium text-xs transition-colors hover:bg-blue-500/20 disabled:opacity-50"
         >
-          ✓ Close enough
+          <span>✓</span> Close enough
         </button>
         <button
           onClick={() => handleSubmit(1)}
           disabled={isLoading}
-          className="p-2 rounded bg-yellow-600 hover:bg-yellow-700 disabled:opacity-50 transition text-white text-sm font-medium"
+          className="flex items-center justify-center gap-2 py-2.5 px-3 rounded-md border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400 font-medium text-xs transition-colors hover:bg-amber-500/20 disabled:opacity-50"
         >
-          ✗ Too high
+          <span>✗</span> Too high
         </button>
         <button
           onClick={() => handleSubmit(0)}
           disabled={isLoading}
-          className="p-2 rounded bg-red-600 hover:bg-red-700 disabled:opacity-50 transition text-white text-sm font-medium"
+          className="flex items-center justify-center gap-2 py-2.5 px-3 rounded-md border border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-400 font-medium text-xs transition-colors hover:bg-red-500/20 disabled:opacity-50"
         >
-          ✗ Very wrong
+          <span>✗</span> Very wrong
         </button>
       </div>
 
       {isLoading && (
-        <div className="mt-3 text-center text-xs text-gray-400">
-          Submitting feedback...
-        </div>
-      )}
-
-      {error && (
-        <div className="mt-3 p-2 rounded bg-red-900 border border-red-700 text-xs text-red-100">
-          Error: {error}
+        <div className="mt-4 text-center text-xs text-muted-foreground animate-pulse font-medium">    
+          ⏳ Submitting feedback...
         </div>
       )}
     </div>
   );
 };
 
-/**
- * FeedbackSummary - Shows aggregated feedback statistics
- */
-export const FeedbackSummary = () => {
-  const { getStats, isLoading, error } = useFeedback();
-  const [stats, setStats] = useState<any>(null);
-
-  useEffect(() => {
-    const loadStats = async () => {
-      const result = await getStats();
-      if (result) {
-        setStats(result);
-      }
-    };
-
-    loadStats();
-    const interval = setInterval(loadStats, 30000); // Refresh every 30 seconds
-
-    return () => clearInterval(interval);
-  }, [getStats]);
-
-  if (isLoading || !stats) {
-    return null;
-  }
-
-  return (
-    <div className="mt-6 p-4 rounded-lg bg-gradient-to-r from-purple-900 to-blue-900 border border-purple-700">
-      <h3 className="text-sm font-semibold text-white mb-3">Model Improvement</h3>
-      
-      <div className="grid grid-cols-3 gap-3">
-        <div className="p-2 rounded bg-black/30 border border-purple-700/50">
-          <div className="text-xs text-gray-400">Feedbacks</div>
-          <div className="text-lg font-bold text-white">{stats.total_feedbacks}</div>
-        </div>
-        
-        <div className="p-2 rounded bg-black/30 border border-purple-700/50">
-          <div className="text-xs text-gray-400">Models Trained</div>
-          <div className="text-lg font-bold text-white">{stats.models_trained}</div>
-        </div>
-        
-        {stats.improvement_percentage !== null && (
-          <div className="p-2 rounded bg-black/30 border border-green-700/50">
-            <div className="text-xs text-gray-400">Improvement</div>
-            <div className="text-lg font-bold text-green-400">
-              {stats.improvement_percentage.toFixed(1)}%
-            </div>
-          </div>
-        )}
-      </div>
-
-      {stats.current_cv_score && (
-        <div className="mt-2 text-xs text-gray-300">
-          Current model accuracy: <span className="text-green-400 font-mono">{(stats.current_cv_score * 100).toFixed(1)}%</span>
-        </div>
-      )}
-
-      {error && (
-        <div className="mt-2 text-xs text-red-300">Error loading stats: {error}</div>
-      )}
-    </div>
-  );
-};

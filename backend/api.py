@@ -44,6 +44,38 @@ from .utils.feature_cache import FeatureCache
 from .utils.continuous_learner import ContinuousLearner
 
 
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+def _calculate_quality_score_decay(hours_since_retrain: float) -> float:
+    """
+    Calculate quality score decay factor based on time since last model retrain.
+    
+    Decay formula:
+    - 0 days: 1.0 (100% confidence)
+    - 7 days: 0.95 (95% confidence)
+    - 30 days: 0.85 (85% confidence)
+    - 90+ days: 0.70 (70% confidence - should retrain)
+    
+    Args:
+        hours_since_retrain: Hours since model was last retrained
+    
+    Returns:
+        Decay factor (0.70 to 1.0) to multiply with confidence score
+    """
+    days_since_retrain = hours_since_retrain / 24.0
+    
+    # Linear decay over 90 days: 1.0 → 0.70
+    if days_since_retrain <= 0:
+        return 1.0
+    elif days_since_retrain >= 90:
+        return 0.70
+    else:
+        # Linear interpolation: (1.0 - 0.70) * (1 - days/90) + 0.70
+        decay = 1.0 - (days_since_retrain / 90.0) * 0.30
+        return max(0.70, decay)
+
 
 app = fastapi.FastAPI(
     title="Sana API",
@@ -115,7 +147,10 @@ class FeedbackRequest(BaseModel):
 class FeedbackResponse(BaseModel):
     status: str  # "stored" or "retrained"
     feedback_count: int
-    cv_score: float | None = None
+    cv_score: float | None = None  # Current cv score after retraining
+    previous_cv_score: float | None = None  # Previous cv score
+    improvement: float | None = None  # Percentage improvement
+    model_version: int | None = None  # Model version number
     next_retrain_at: int | None = None
     message: str | None = None
 
@@ -628,6 +663,7 @@ async def get_cleaning_metrics(run_id: str):
 async def get_quality_assessment(run_id: str) -> dict[str, Any]:
     """
     Get ML-based quality assessment for a run's cleaned data.
+    Includes quality score decay based on time since last model retraining.
     """
     try:
         state = get_run(run_id)
@@ -673,11 +709,40 @@ async def get_quality_assessment(run_id: str) -> dict[str, Any]:
             validation_status = validation_data.get("status", "unknown")
             confidence = validation_data.get("overall_confidence", 0.5)
         
+        # Calculate quality score decay based on time since retrain
+        decay_factor = 1.0
+        hours_since_retrain = 0.0
+        retrain_timestamp = None
+        
+        try:
+            learner = ContinuousLearner()
+            history = learner.get_model_history(max_records=1)
+            
+            if history and "timestamp" in history[0]:
+                retrain_timestamp = history[0]["timestamp"]
+                # Parse ISO format timestamp
+                last_retrain = dt.datetime.fromisoformat(retrain_timestamp)
+                now = dt.datetime.now(dt.timezone.utc)
+                
+                # Handle timezone-aware and naive datetimes
+                if last_retrain.tzinfo is None:
+                    last_retrain = last_retrain.replace(tzinfo=dt.timezone.utc)
+                
+                time_diff = now - last_retrain
+                hours_since_retrain = time_diff.total_seconds() / 3600.0
+                decay_factor = _calculate_quality_score_decay(hours_since_retrain)
+        except Exception as e:
+            print(f"[API] Warning: Could not calculate decay factor: {e}")
+        
         return JSONResponse({
             "run_id": run_id,
             "ml_assessment": assessment,
             "validation_status": validation_status,
             "confidence": confidence,
+            "decay_factor": round(decay_factor, 2),
+            "hours_since_retrain": round(hours_since_retrain, 1),
+            "last_retrain_timestamp": retrain_timestamp,
+            "effective_confidence": round(confidence * decay_factor, 2),
             "timestamp": dt.datetime.now(dt.timezone.utc).isoformat()
         })
     
@@ -1363,11 +1428,33 @@ async def record_feedback(request: FeedbackRequest) -> FeedbackResponse:
                     if deleted > 0:
                         print(f"[API] Cleaned {deleted} old feedback records after retrain")
                     
+                    # Reload model into memory (important for stateful scoring)
+                    print("[API] Reloading retrained model...")
+                    scorer = MLQualityScorer()
+                    scorer.reload_model()
+                    print("[API] ✓ Model reloaded successfully")
+                    
+                    # Get model version and calculate improvement
+                    model_history = learner.get_model_history(max_records=2)
+                    model_version = len(model_history) if model_history else 1
+                    
+                    previous_cv_score = None
+                    improvement_pct = None
+                    
+                    if len(model_history) >= 2:
+                        previous_cv_score = model_history[1].get("cv_score")
+                        current_cv_score = result["cv_score"]
+                        if previous_cv_score and previous_cv_score > 0:
+                            improvement_pct = ((current_cv_score - previous_cv_score) / previous_cv_score) * 100
+                    
                     return FeedbackResponse(
                         status="retrained",
                         feedback_count=count,
                         cv_score=result["cv_score"],
-                        message=f"✓ Model retrained! CV Score: {result['cv_score']:.1%} on {result['total_samples']} samples"
+                        previous_cv_score=previous_cv_score,
+                        improvement=improvement_pct,
+                        model_version=model_version,
+                        message="✓ Thank you! Your feedback helps us improve our quality assessments."
                     )
                 else:
                     next_retrain = 5 if count == 1 else (5 - (count % 5))
@@ -1411,17 +1498,22 @@ async def record_feedback(request: FeedbackRequest) -> FeedbackResponse:
 
 
 @app.get("/api/feedback/stats")
-async def get_feedback_stats() -> FeedbackStatsResponse:
+async def get_feedback_stats() -> dict[str, Any]:
     """
     Get feedback loop statistics and model improvement metrics.
+    Includes model decay status and recommendations for retraining.
     
     Returns:
-        FeedbackStatsResponse with:
+        Dictionary with:
         - total_feedbacks: Number of feedback records
         - models_trained: Number of retraining events  
         - current_cv_score: Latest model's cross-val score
         - latest_retrain_at: Timestamp of last retrain
         - improvement_percentage: Score improvement (if multiple retrains)
+        - hours_since_retrain: Hours since last model retraining
+        - decay_factor: Current quality score decay factor
+        - model_status: "fresh" (0-7 days), "good" (7-30 days), "aging" (30-90 days), "stale" (90+ days)
+        - next_retrain_recommended_at: Hours remaining before retraining recommended
     """
     try:
         feedback_db = FeedbackDB()
@@ -1434,6 +1526,10 @@ async def get_feedback_stats() -> FeedbackStatsResponse:
         current_cv_score = None
         latest_retrain_at = None
         improvement_percentage = None
+        hours_since_retrain = 0.0
+        decay_factor = 1.0
+        model_status = "unknown"
+        next_retrain_recommended_at = None
         
         if history:
             latest = history[-1]
@@ -1445,14 +1541,50 @@ async def get_feedback_stats() -> FeedbackStatsResponse:
                 first = history[0]
                 first_score = first.get("cv_score", 0.0)
                 improvement_percentage = ((current_cv_score - first_score) / first_score * 100) if first_score > 0 else None
+            
+            # Calculate time since retrain and decay
+            if latest_retrain_at:
+                try:
+                    last_retrain = dt.datetime.fromisoformat(latest_retrain_at)
+                    now = dt.datetime.now(dt.timezone.utc)
+                    
+                    # Handle timezone-aware and naive datetimes
+                    if last_retrain.tzinfo is None:
+                        last_retrain = last_retrain.replace(tzinfo=dt.timezone.utc)
+                    
+                    time_diff = now - last_retrain
+                    hours_since_retrain = time_diff.total_seconds() / 3600.0
+                    decay_factor = _calculate_quality_score_decay(hours_since_retrain)
+                    
+                    # Determine model status based on age
+                    days_old = hours_since_retrain / 24.0
+                    if days_old < 7:
+                        model_status = "fresh"
+                    elif days_old < 30:
+                        model_status = "good"
+                    elif days_old < 90:
+                        model_status = "aging"
+                    else:
+                        model_status = "stale"
+                    
+                    # Calculate hours until retraining is recommended (at 30 days)
+                    hours_until_recommended_retrain = max(0, (30 * 24) - hours_since_retrain)
+                    next_retrain_recommended_at = hours_until_recommended_retrain
+                    
+                except Exception as e:
+                    print(f"[API] Error calculating decay: {e}")
         
-        return FeedbackStatsResponse(
-            total_feedbacks=total_feedbacks,
-            models_trained=models_trained,
-            current_cv_score=current_cv_score,
-            latest_retrain_at=latest_retrain_at,
-            improvement_percentage=improvement_percentage
-        )
+        return {
+            "total_feedbacks": total_feedbacks,
+            "models_trained": models_trained,
+            "current_cv_score": current_cv_score,
+            "latest_retrain_at": latest_retrain_at,
+            "improvement_percentage": improvement_percentage,
+            "hours_since_retrain": round(hours_since_retrain, 1),
+            "decay_factor": round(decay_factor, 2),
+            "model_status": model_status,
+            "next_retrain_recommended_at": round(next_retrain_recommended_at, 1) if next_retrain_recommended_at else None
+        }
     
     except Exception as e:
         print(f"[API] Stats error: {e}")

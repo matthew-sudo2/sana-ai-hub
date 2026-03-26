@@ -232,8 +232,7 @@ class MLAssessmentVisualizer:
 **Prediction:** `{self.quality}` | **Confidence:** `{self.confidence:.1f}%`
 
 ### Model Overview
-Random Forest classifier trained on 32 labeled datasets (11 real GOOD, 8 synthetic GOOD, 13 BAD).
-Real-world performance: 87.1% ± 7.9% k-fold cross-validation accuracy.
+Random Forest classifier trained on diverse domain datasets including finance, healthcare, stock market data, mental health records, and more. The model extracts statistical features from your data and classifies it as either good or bad quality based on learned patterns from real-world examples.
 
 ### Feature Analysis
 

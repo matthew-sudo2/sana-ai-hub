@@ -6,6 +6,7 @@ import { useToast } from "@/hooks/use-toast";
 import StatisticsPanel from "@/components/StatisticsPanel";
 import ColumnSelector from "@/components/ColumnSelector";
 import { calculateMultipleColumnStats, ColumnStatistics } from "@/lib/statistics";
+import { FeedbackWidget } from "@/components/FeedbackWidget";
 
 const DataViewerContent = () => {
   const { csvData, isLoading, runId } = usePipeline();
@@ -20,9 +21,31 @@ const DataViewerContent = () => {
   const [showStatistics, setShowStatistics] = useState(false);
   const [selectedColumns, setSelectedColumns] = useState<string[]>([]);
   const [calculatedStats, setCalculatedStats] = useState<ColumnStatistics[]>([]);
+  const [datasetHash, setDatasetHash] = useState("");
+  const [features, setFeatures] = useState<number[]>([]);
 
   const rows = csvData || [];
   const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
+
+  // Fetch features and hash from API when run completes
+  useEffect(() => {
+    if (runId) {
+      fetch(`http://localhost:8000/api/features/${runId}`)
+        .then(r => r.json())
+        .then(data => {
+          if (data.features && data.features.length === 8) {
+            setFeatures(data.features);
+          }
+          if (data.dataset_hash) {
+            setDatasetHash(data.dataset_hash);
+          }
+        })
+        .catch(e => {
+          console.warn("[DataViewerContent] Could not fetch features:", e);
+          setDatasetHash(`run_${runId}`);
+        });
+    }
+  }, [runId]);
 
   useEffect(() => {
     if (columns.length > 0 && visibleColumns.length === 0) {
@@ -301,6 +324,17 @@ const DataViewerContent = () => {
             })}
               </div>
             </div>
+            )}
+
+            {/* Feedback Widget & Summary */}
+            {rows.length > 0 && (
+              <div className="py-4 border-b bg-background mb-4">
+                <FeedbackWidget
+                  datasetHash={datasetHash}
+                  predictedScore={stats.avgQuality}
+                  features={features}
+                />
+              </div>
             )}
 
             {/* Data Controls */}

@@ -35,30 +35,65 @@ from backend.agents.scout import (
 
 
 def extract_features(df):
-    """Extract 6 base features from a dataset - matching original synthetic data format."""
+    """Extract 8 features matching MLQualityScorer exactly."""
+    from scipy.stats import skew, kurtosis
     
-    # Compute quality metrics
-    completeness = _compute_completeness(df)
-    consistency = _compute_consistency(df)
-    accuracy = _compute_accuracy_score(df)
-    duplicates = _compute_duplicate_score(df)
-    outliers = _compute_outlier_score(df)
+    # Feature 1: Missing data ratio
+    missing_ratio = df.isnull().sum().sum() / (len(df) * len(df.columns)) if (len(df) * len(df.columns)) > 0 else 0
     
-    # Base 6 features only
-    missing_ratio = 1 - completeness
-    duplicate_ratio = 1 - duplicates  # Inverse of uniqueness
-    numeric_ratio = len(df.select_dtypes(include=[np.number]).columns) / len(df.columns)
+    # Feature 2: Duplicate row ratio
+    duplicate_ratio = 1 - (len(df.drop_duplicates()) / len(df)) if len(df) > 0 else 0
+    
+    # Feature 3: Numeric column ratio
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    numeric_ratio = len(numeric_cols) / len(df.columns) if len(df.columns) > 0 else 0
+    
+    # Feature 4: Constant columns (only 1 unique value)
     constant_cols = sum(1 for col in df.columns if df[col].nunique() <= 1)
     
-    numeric_cols = df.select_dtypes(include=[np.number])
-    variance = numeric_cols.var().mean() if not numeric_cols.empty else 0.0
-    variance = 0.0 if np.isnan(variance) else variance
+    # Feature 5: Normalized variance (Coefficient of Variation)
+    cv_list = []
+    for col in numeric_cols:
+        try:
+            mean_val = df[col].mean()
+            std_val = df[col].std()
+            if abs(mean_val) > 1e-10:
+                cv = min(abs(std_val / mean_val), 100)
+                cv_list.append(cv)
+        except:
+            pass
+    norm_variance = np.mean(cv_list) if cv_list else 0
     
-    skewness = numeric_cols.skew().abs().mean() if not numeric_cols.empty else 0.0
-    skewness = 0.0 if np.isnan(skewness) else skewness
+    # Feature 6: Skewness
+    skewness_list = []
+    for col in numeric_cols:
+        try:
+            s = skew(df[col].dropna())
+            skewness_list.append(abs(s))
+        except:
+            pass
+    skewness = np.mean(skewness_list) if skewness_list else 0
+    
+    # Feature 7: Cardinality ratio (avg unique values / rows)
+    cardinalities = [df[col].nunique() for col in df.columns] if len(df.columns) > 0 else []
+    avg_cardinality = np.mean(cardinalities) if cardinalities else 0
+    cardinality_ratio = (avg_cardinality / len(df)) if len(df) > 0 else 0
+    cardinality_ratio = min(cardinality_ratio, 1.0)
+    
+    # Feature 8: Mean Kurtosis (distribution shape)
+    kurtosis_list = []
+    for col in numeric_cols:
+        try:
+            kurt = kurtosis(df[col].dropna())
+            if not np.isnan(kurt):
+                kurtosis_list.append(abs(kurt))
+        except:
+            pass
+    mean_kurtosis = np.mean(kurtosis_list) if kurtosis_list else 0
+    mean_kurtosis = min(mean_kurtosis / 10, 1.0)
     
     return [missing_ratio, duplicate_ratio, numeric_ratio, constant_cols,
-            variance, skewness]
+            norm_variance, skewness, cardinality_ratio, mean_kurtosis]
 
 
 def load_real_labeled_data():
@@ -196,7 +231,7 @@ def main():
     print("\n[6] Feature importance:")
     feature_names = [
         'missing_ratio', 'duplicate_ratio', 'numeric_ratio', 'constant_cols',
-        'variance', 'skewness', 'M×D', 'M×N', 'V×S', 'log(V)', 'log(|S|)', 'V/S', 'S/V'
+        'norm_variance', 'skewness', 'cardinality_ratio', 'mean_kurtosis'
     ]
     importances = model.feature_importances_
     for name, importance in sorted(zip(feature_names, importances), key=lambda x: x[1], reverse=True):

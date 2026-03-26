@@ -4,7 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { usePipeline } from "@/context/PipelineContext";
 import { downloadCSV } from "@/lib/api";
 import { useToast } from "@/hooks/use-toast";
-import { FeedbackWidget, FeedbackSummary } from "@/components/FeedbackWidget";
+import { FeedbackWidget } from "@/components/FeedbackWidget";
 
 const DataViewer = () => {
   const { csvData, isLoading, runId } = usePipeline();
@@ -22,13 +22,27 @@ const DataViewer = () => {
   const rows = csvData || [];
   const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
 
+  // DEBUG: Log when data changes
+  useEffect(() => {
+    console.log("====== DataViewer DEBUG ======");
+    console.log("csvData:", csvData);
+    console.log("rows.length:", rows.length);
+    console.log("runId:", runId);
+    console.log("datasetHash:", datasetHash);
+    console.log("features:", features);
+    console.log("Should FeedbackWidget render?", rows.length > 0);
+    console.log("==============================");
+  }, [csvData, rows.length, runId, datasetHash, features]);
+
   // Fetch features and hash from API when run completes
   useEffect(() => {
     if (runId) {
+      console.log("[DataViewer] Fetching features for runId:", runId);
       // Fetch cached features from backend  
       fetch(`/api/features/${runId}`)
         .then(r => r.json())
         .then(data => {
+          console.log("[DataViewer] Features API response:", data);
           if (data.features && data.features.length === 8) {
             setFeatures(data.features);
             console.log("[DataViewer] Features loaded:", data.features);
@@ -284,15 +298,6 @@ const DataViewer = () => {
             </div>
           </div>
 
-          {/* Feedback Widget & Summary */}
-          <div className="px-6 py-4 border-b">
-            <FeedbackWidget
-              datasetHash={datasetHash}
-              predictedScore={stats.avgQuality}
-              features={features}
-            />
-            <FeedbackSummary />
-          </div>
         </div>
       )}
 
@@ -331,6 +336,17 @@ const DataViewer = () => {
               );
             })}
           </div>
+        </div>
+      )}
+
+      {/* Feedback Widget */}
+      {rows.length > 0 && (
+        <div className="px-6 py-4 border-b">
+          <FeedbackWidget
+            datasetHash={datasetHash}
+            predictedScore={stats.avgQuality}
+            features={features}
+          />
         </div>
       )}
 
