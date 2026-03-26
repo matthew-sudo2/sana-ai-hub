@@ -946,7 +946,6 @@ async def create_custom_chart(run_id: str, request: CustomChartRequest):
         return JSONResponse(status_code=500, content={"error": f"Unexpected error: {str(e)}"})
 
 
-<<<<<<< HEAD
 @app.post("/runs/{run_id}/visualize-natural-language")
 async def visualize_natural_language(run_id: str, request: CustomChartRequest):
     """
@@ -963,41 +962,10 @@ async def visualize_natural_language(run_id: str, request: CustomChartRequest):
 
     Uses the Artist Agent's natural language parser to understand intent,
     then executes appropriate visualization based on PlotSpec.
-=======
-@app.get("/runs/{run_id}/charts/{chart_type}/explanation")
-async def get_chart_explanation(
-    run_id: str,
-    chart_type: str,
-    x: str = "",
-    y: str = "",
-    dataset: str = "dataset",
-):
-    """
-    Fetch cached explanation for a visualization.
-    
-    Query parameters:
-    - x: x-axis column name (or empty for single-column charts)
-    - y: y-axis column name
-    - dataset: dataset name/identifier
-    
-    Returns:
-    {
-        "explanation": {
-            "summary": "...",
-            "insight": "...",
-            "interpretation": "...",
-            "suggestion": "..."
-        }
-    }
-    
-    Returns 202 (Accepted) if explanation is still being generated.
-    Returns 404 if chart or explanation not found.
->>>>>>> main
     """
     try:
         state = get_run(run_id)
         if not state:
-<<<<<<< HEAD
             return JSONResponse(status_code=404, content={"error": f"Run {run_id} not found"})
 
         csv_path = _resolve_cleaned_csv_path(state)
@@ -1066,7 +1034,41 @@ async def get_chart_explanation(
         return JSONResponse(
             status_code=500,
             content={"error": f"Natural language visualization failed: {str(e)}"}
-=======
+        )
+
+
+@app.get("/runs/{run_id}/charts/{chart_type}/explanation")
+async def get_chart_explanation(
+    run_id: str,
+    chart_type: str,
+    x: str = "",
+    y: str = "",
+    dataset: str = "dataset",
+):
+    """
+    Fetch cached explanation for a visualization.
+    
+    Query parameters:
+    - x: x-axis column name (or empty for single-column charts)
+    - y: y-axis column name
+    - dataset: dataset name/identifier
+    
+    Returns:
+    {
+        "explanation": {
+            "summary": "...",
+            "insight": "...",
+            "interpretation": "...",
+            "suggestion": "..."
+        }
+    }
+    
+    Returns 202 (Accepted) if explanation is still being generated.
+    Returns 404 if chart or explanation not found.
+    """
+    try:
+        state = get_run(run_id)
+        if not state:
             return JSONResponse(
                 status_code=404,
                 content={"error": f"Run {run_id} not found"},
@@ -1100,7 +1102,6 @@ async def get_chart_explanation(
         return JSONResponse(
             status_code=500,
             content={"error": f"Failed to fetch explanation: {str(e)}"},
->>>>>>> main
         )
 
 
