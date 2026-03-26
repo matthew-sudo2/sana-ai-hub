@@ -37,6 +37,8 @@ from .agents.analyst import (
     _save_cached_explanation,
     VisualizationExplanation,
 )
+from .utils.ml_quality_scorer import MLQualityScorer
+
 
 
 app = fastapi.FastAPI(
@@ -45,12 +47,14 @@ app = fastapi.FastAPI(
     version="1.0.0",
 )
 
-# CORS for frontend (Vite dev server runs on localhost:8080)
+# CORS for frontend (Vite dev server runs on localhost:8080/8081)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:8080",
+        "http://localhost:8081",
         "http://127.0.0.1:8080",
+        "http://127.0.0.1:8081",
         "http://localhost:5173",
         "http://localhost:3000",
         "http://127.0.0.1:5173",
@@ -80,6 +84,21 @@ class RunResponse(BaseModel):
 
 class CustomChartRequest(BaseModel):
     instruction: str
+
+
+class MLQualityAssessment(BaseModel):
+    quality: str  # "GOOD" or "BAD"
+    score: float  # 0-100
+    probability_good: float
+    probability_bad: float
+    features: list[float]
+
+
+class QualityCheckResponse(BaseModel):
+    run_id: str
+    ml_assessment: MLQualityAssessment
+    validation_status: str
+    confidence: float
 
 
 # ============================================================================
@@ -254,7 +273,7 @@ async def download_csv(run_id: str):
 @app.get("/runs/{run_id}/images")
 async def list_images(run_id: str):
     """
-    List all PNG images from Phase 3 output.
+    List all PNG images from Phase 3 output (excluding ML assessment images).
 
     Returns: {images: [filename1.png, filename2.png, ...]}
     """
@@ -272,7 +291,8 @@ async def list_images(run_id: str):
         )
 
     output_dir = Path(state["artist_output_dir"])
-    pngs = sorted([f.name for f in output_dir.glob("*.png")])
+    # Filter out ML assessment images (ml_*)  - they go to validation report only
+    pngs = sorted([f.name for f in output_dir.glob("*.png") if not f.name.startswith("ml_")])
 
     return JSONResponse(
         {
@@ -453,6 +473,101 @@ async def get_validation_result(run_id: str):
     return JSONResponse(_read_json_file(result_path))
 
 
+@app.get("/runs/{run_id}/ml-assessment/{image_file}", response_model=None)
+async def get_ml_assessment_image(run_id: str, image_file: str):
+    """
+    Get ML assessment visualization images (confidence gauge, radar, comparison, probability).
+    Serves PNG images from validator output directory.
+    
+    Windows path limitation (260 chars) can truncate directory names. This endpoint:
+    1. First tries UUID (short) lookup in _RUNS state
+    2. Then searches file system for directory prefix match
+    3. Returns image file by searching recursively through runs/
+    """
+    # Validate filename - strict security check
+    if ".." in image_file or "/" in image_file or "\\" in image_file:
+        return JSONResponse(status_code=400, content={"error": "Invalid filename"})
+    
+    if not image_file.startswith("ml_") or not image_file.endswith(".png"):
+        return JSONResponse(status_code=400, content={"error": "Invalid image file"})
+    
+    runs_base = Path(__file__).parent / "runs"
+    
+    # Strategy 1: Try UUID lookup first (if run_id is short UUID)
+    state = get_run(run_id)
+    if state and state.get("validator_output_dir"):
+        candidate = Path(state["validator_output_dir"]) / image_file
+        if candidate.exists() and candidate.is_file():
+            try:
+                return FileResponse(candidate, media_type="image/png")
+            except Exception:
+                pass
+    
+    # Strategy 2: Search file system for matching directory
+    # The run_id might be truncated due to Windows 260-char path limit
+    # Try to find any directory that starts with the given run_id
+    if runs_base.exists():
+        for run_dir in runs_base.iterdir():
+            if not run_dir.is_dir():
+                continue
+            
+            # Check if directory name matches (exact or prefix)
+            dir_name = run_dir.name
+            if dir_name == run_id or dir_name.startswith(run_id):
+                image_path = run_dir / image_file
+                if image_path.exists() and image_path.is_file():
+                    try:
+                        return FileResponse(image_path, media_type="image/png")
+                    except Exception:
+                        pass
+    
+    # Strategy 3: If still not found, search for the image file anywhere in runs/
+    # This handles cases where the entire directory name is truncated
+    if runs_base.exists():
+        for run_dir in runs_base.iterdir():
+            if not run_dir.is_dir():
+                continue
+            image_path = run_dir / image_file
+            if image_path.exists() and image_path.is_file():
+                # Return the first match found
+                try:
+                    return FileResponse(image_path, media_type="image/png")
+                except Exception:
+                    pass
+    
+    # Not found
+    return JSONResponse(status_code=404, content={"error": f"Image not found: {image_file}"})
+
+
+@app.get("/runs/{run_id}/validation-report")
+async def get_validation_report_markdown(run_id: str):
+    """Get validation_report.md with full markdown content."""
+    state = get_run(run_id)
+    if not state:
+        return JSONResponse(status_code=404, content={"error": f"Run {run_id} not found"})
+    
+    output_dir = (
+        state["validator_output_dir"]
+        or state["artist_output_dir"]
+        or state["analyst_output_dir"]
+        or state["labeler_output_dir"]
+        or state["scout_output_dir"]
+    )
+    
+    if not output_dir:
+        return JSONResponse(status_code=202, content={"error": "Validation not yet available"})
+    
+    report_path = Path(output_dir) / "validation_report.md"
+    if not report_path.exists():
+        return JSONResponse(status_code=404, content={"error": "validation_report.md not found"})
+    
+    try:
+        report_content = report_path.read_text(encoding="utf-8")
+        return JSONResponse({"content": report_content, "run_id": run_id})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.get("/runs/{run_id}/cleaning-metrics")
 async def get_cleaning_metrics(run_id: str):
     """Get cleaning metrics from phase2_summary.json (labeler phase output)."""
@@ -480,6 +595,70 @@ async def get_cleaning_metrics(run_id: str):
     # Extract just the cleaning_metrics field if present
     metrics = summary.get("cleaning_metrics", {})
     return JSONResponse(metrics)
+
+
+@app.get("/runs/{run_id}/quality-assessment")
+async def get_quality_assessment(run_id: str) -> dict[str, Any]:
+    """
+    Get ML-based quality assessment for a run's cleaned data.
+    """
+    try:
+        state = get_run(run_id)
+        if not state:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Run {run_id} not found"}
+            )
+        
+        output_dir = (
+            state["validator_output_dir"]
+            or state["artist_output_dir"]
+            or state["analyst_output_dir"]
+            or state["labeler_output_dir"]
+        )
+        
+        if not output_dir:
+            return JSONResponse(
+                status_code=202,
+                content={"error": "Cleaning phase not yet complete"}
+            )
+        
+        cleaned_csv = Path(output_dir) / "cleaned_data.csv"
+        
+        if not cleaned_csv.exists():
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Cleaned data not found for run {run_id}"}
+            )
+        
+        # Load and score
+        df = pd.read_csv(cleaned_csv)
+        scorer = MLQualityScorer()
+        assessment = scorer.score(df)
+        
+        # Get validation status
+        validation_result_path = Path(output_dir) / "validation_result.json"
+        validation_status = "unknown"
+        confidence = 0.5
+        
+        if validation_result_path.exists():
+            validation_data = json.loads(validation_result_path.read_text())
+            validation_status = validation_data.get("status", "unknown")
+            confidence = validation_data.get("overall_confidence", 0.5)
+        
+        return JSONResponse({
+            "run_id": run_id,
+            "ml_assessment": assessment,
+            "validation_status": validation_status,
+            "confidence": confidence,
+            "timestamp": dt.datetime.now(dt.timezone.utc).isoformat()
+        })
+    
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to get quality assessment: {str(e)}"}
+        )
 
 
 def _read_json_file(path: Path) -> dict[str, Any]:

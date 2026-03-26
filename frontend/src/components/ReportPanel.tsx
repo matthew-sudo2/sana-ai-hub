@@ -148,6 +148,30 @@ const ReportPanel = () => {
                           <th className={`border bg-muted px-3 py-2 text-xs font-semibold text-left ${isClean ? 'text-success' : 'text-foreground'}`} {...props}>{children}</th>
                         );
                       },
+                      img: ({ node, src, alt, ...props }) => {
+                        // Handle image URLs - convert relative paths to full URLs
+                        let imageSrc = src || "";
+                        if (imageSrc.startsWith("/")) {
+                          // Convert relative path to full backend URL
+                          imageSrc = `http://localhost:8000${imageSrc}`;
+                        }
+                        return (
+                          <div className="my-6 rounded-lg overflow-hidden border border-border shadow-md bg-muted/30 p-3">
+                            <img 
+                              src={imageSrc} 
+                              alt={alt || "Visualization"} 
+                              className="w-full h-auto rounded"
+                              loading="lazy"
+                              onError={(e) => {
+                                // Log error for debugging
+                                console.warn(`Image failed to load: ${imageSrc}`);
+                              }}
+                              {...props}
+                            />
+                            {alt && <p className="text-xs text-muted-foreground mt-2 text-center">{alt}</p>}
+                          </div>
+                        );
+                      },
                       blockquote: ({ node, ...props }) => (
                         <blockquote className="border-l-4 border-primary pl-4 text-sm italic my-3 text-muted-foreground" {...props} />
                       ),

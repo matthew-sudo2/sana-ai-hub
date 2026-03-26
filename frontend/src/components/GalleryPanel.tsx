@@ -410,7 +410,9 @@ const GalleryPanel = () => {
   const refreshImages = async () => {
     if (!runId) return;
     const list = await fetchImagesList(runId);
-    setDisplayImages(list.images);
+    // Filter out ML assessment images - they should only appear in validation report
+    const filteredImages = list.images.filter(img => !img.startsWith('ml_'));
+    setDisplayImages(filteredImages);
   };
 
   const handleGenerateCustomChart = async () => {
