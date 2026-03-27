@@ -1,6 +1,7 @@
 """
 Continuous Learning: Model Retraining with Accumulated Feedback
 Automatically retrains RandomForest when enough feedback is collected.
+Implements shadow validation before model promotion to production.
 """
 
 import numpy as np
@@ -14,6 +15,7 @@ from sklearn.model_selection import cross_val_score
 from typing import Dict, Any
 
 from .feedback_db import FeedbackDB
+from .validate_model_promotion import ModelPromotionValidator
 
 
 class ContinuousLearner:
@@ -119,9 +121,13 @@ class ContinuousLearner:
             print(f"✗ Cross-validation failed: {e}")
             return 0.0
     
-    def _backup_old_model(self) -> Path:
+    def _backup_old_model(self, keep_recent: int = 3) -> Path:
         """
         Backup current model with timestamp.
+        Automatically archives old backups (keeps only N most recent).
+        
+        Args:
+            keep_recent: Number of recent backups to keep in models/ directory
         
         Returns:
             Path to backup file
@@ -135,10 +141,46 @@ class ContinuousLearner:
         try:
             shutil.copy(self.model_path, backup_path)
             print(f"[Learner] ✓ Backed up old model → {backup_path.name}")
+            
+            # Auto-rotate: archive old backups
+            self._rotate_old_backups(keep_recent)
+            
             return backup_path
         except Exception as e:
             print(f"✗ Backup failed: {e}")
             return None
+    
+    def _rotate_old_backups(self, keep_recent: int = 3) -> None:
+        """
+        Archive old backups when count exceeds threshold.
+        
+        Args:
+            keep_recent: Number of recent backups to keep in models/
+        """
+        try:
+            # Find all backup files in models directory
+            backup_files = sorted(self.model_dir.glob("best_model_bak_*.pkl"))
+            
+            if len(backup_files) <= keep_recent:
+                return  # Within threshold, no rotation needed
+            
+            # Create archive directory
+            archive_backups_dir = self.model_dir / "archived" / "backups"
+            archive_backups_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Archive old ones (keep most recent N)
+            to_archive = backup_files[:-keep_recent]
+            
+            for old_backup in to_archive:
+                try:
+                    dest = archive_backups_dir / old_backup.name
+                    shutil.move(str(old_backup), str(dest))
+                    print(f"[Learner] ⧉ Archived old backup → {old_backup.name}")
+                except Exception as e:
+                    print(f"[Learner] ⚠ Could not archive {old_backup.name}: {e}")
+        
+        except Exception as e:
+            print(f"[Learner] ⚠ Backup rotation failed (non-critical): {e}")
     
     def _save_model(self, model: RandomForestClassifier) -> bool:
         """
@@ -162,7 +204,15 @@ class ContinuousLearner:
             print(f"✗ Model save failed: {e}")
             return False
     
-    def _log_metrics(self, cv_score: float, feedback_count: int, total_samples: int) -> bool:
+    def _log_metrics(
+        self, 
+        cv_score: float, 
+        feedback_count: int, 
+        total_samples: int,
+        promoted: bool = True,
+        validation_reason: str = "",
+        improvement: Dict = None
+    ) -> bool:
         """
         Log retraining metrics to JSONL file (append-only).
         
@@ -170,6 +220,9 @@ class ContinuousLearner:
             cv_score: Cross-validation accuracy
             feedback_count: Number of feedback samples used
             total_samples: Total training samples after combining
+            promoted: Whether model was promoted to production
+            validation_reason: Reason for promotion/rejection
+            improvement: Dictionary with metric improvements
         
         Returns:
             True if successful
@@ -183,7 +236,10 @@ class ContinuousLearner:
                 "feedback_samples": feedback_count,
                 "total_training_samples": total_samples,
                 "model_type": "RandomForestClassifier",
-                "action": "retrain"
+                "action": "retrain",
+                "promoted": promoted,
+                "validation_reason": validation_reason,
+                "improvement": improvement or {}
             }
             
             with open(self.metrics_path, "a") as f:
@@ -203,15 +259,19 @@ class ContinuousLearner:
             Dictionary with retraining results:
             {
                 "success": bool,
+                "promoted": bool,
                 "cv_score": float,
                 "feedback_count": int,
                 "total_samples": int,
+                "validation_reason": str,
                 "error": str (if failed)
             }
         """
         print("\n" + "="*70)
-        print("CONTINUOUS LEARNING: MODEL RETRAINING")
+        print("CONTINUOUS LEARNING: MODEL RETRAINING WITH SHADOW VALIDATION")
         print("="*70)
+        
+        candidate_model_path = None
         
         try:
             # Step 1: Load original training data
@@ -226,10 +286,12 @@ class ContinuousLearner:
                 print("✗ No feedback data to retrain on. Skipping retrain.")
                 return {
                     "success": False,
+                    "promoted": False,
                     "error": "No feedback data available",
                     "cv_score": 0.0,
                     "feedback_count": 0,
-                    "total_samples": len(X_orig)
+                    "total_samples": len(X_orig),
+                    "validation_reason": "No feedback to retrain"
                 }
             
             # Step 3: Combine datasets
@@ -259,39 +321,104 @@ class ContinuousLearner:
             model.fit(X, y)
             print(f"[Learner] ✓ Model trained on {len(X)} samples")
             
-            # Step 7: Backup and save
-            print("\n[Step 7] Backup & deployment...")
-            self._backup_old_model()
+            # Step 7: Save candidate model with timestamp for visibility
+            print("\n[Step 7] Saving candidate model for validation...")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            candidate_model_path = self.model_dir / f"best_model_candidate_{timestamp}.pkl"
+            try:
+                with open(candidate_model_path, "wb") as f:
+                    pickle.dump(model, f)
+                print(f"[Learner] ✓ Candidate saved to {candidate_model_path.name}")
+            except Exception as e:
+                raise Exception(f"Failed to save candidate model: {e}")
             
-            if not self._save_model(model):
-                raise Exception("Failed to save model")
+            # Step 8: Run shadow validation against current model
+            print("\n[Step 8] Running shadow validation against current model...")
+            validator = ModelPromotionValidator()
+            validation_results = validator.validate(candidate_model_path)
             
-            # Step 8: Log metrics
-            print("\n[Step 8] Logging metrics...")
-            self._log_metrics(cv_score, len(X_feedback), len(X))
+            promoted = validation_results["promoted"]
+            validation_reason = validation_results["reason"]
+            
+            # Step 9: Backup current model and promote/archive based on validation
+            print("\n[Step 9] Backup & deployment decision...")
+            
+            if promoted:
+                print(f"✓ PROMOTION APPROVED: {validation_reason}")
+                self._backup_old_model()
+                
+                # Move candidate to production
+                try:
+                    shutil.move(str(candidate_model_path), str(self.model_path))
+                    print(f"[Learner] ✓ Candidate promoted: {candidate_model_path.name} → {self.model_path.name}")
+                except Exception as e:
+                    raise Exception(f"Failed to promote model: {e}")
+            else:
+                print(f"✗ PROMOTION REJECTED: {validation_reason}")
+                self._backup_old_model()
+                
+                # Archive rejected candidate to archived folder (removes from models/)
+                try:
+                    archived_dir = self.model_dir / "archived"
+                    archived_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    rejected_path = archived_dir / f"best_model_candidate_{timestamp}_REJECTED.pkl"
+                    if candidate_model_path.exists():
+                        shutil.move(str(candidate_model_path), str(rejected_path))
+                        print(f"[Learner] ✓ Candidate archived: {rejected_path.name}")
+                except Exception as e:
+                    print(f"[Learner] ⚠ Could not archive candidate: {e}")
+                
+                # Current best_model.pkl remains unchanged
+                print(f"[Learner] ✓ Current model retained in production")
+            
+            # Step 10: Log metrics
+            print("\n[Step 10] Logging metrics...")
+            self._log_metrics(
+                cv_score, 
+                len(X_feedback), 
+                len(X),
+                promoted=promoted,
+                validation_reason=validation_reason,
+                improvement=validation_results.get("improvement", {})
+            )
             
             print("\n" + "="*70)
-            print("✓ RETRAINING COMPLETE")
+            if promoted:
+                print("✓ RETRAINING & PROMOTION COMPLETE")
+            else:
+                print("✓ RETRAINING COMPLETE (Model validation failed, retained current)")
             print(f"  CV Score: {cv_score:.1%}")
             print(f"  Feedback Samples: {len(X_feedback)}")
             print(f"  Total Training Samples: {len(X)}")
+            print(f"  Status: {'PROMOTED ✓' if promoted else 'ARCHIVED (not good enough)'}")
+            print(f"  Reason: {validation_reason}")
             print("="*70 + "\n")
             
             return {
                 "success": True,
+                "promoted": promoted,
                 "cv_score": float(cv_score),
                 "feedback_count": len(X_feedback),
-                "total_samples": len(X)
+                "total_samples": len(X),
+                "validation_reason": validation_reason
             }
         
         except Exception as e:
             print(f"\n✗ RETRAINING FAILED: {e}")
+            
+            # Clean up candidate if it exists
+            if candidate_model_path and candidate_model_path.exists():
+                candidate_model_path.unlink()
+            
             return {
                 "success": False,
+                "promoted": False,
                 "error": str(e),
                 "cv_score": 0.0,
                 "feedback_count": 0,
-                "total_samples": 0
+                "total_samples": 0,
+                "validation_reason": f"Error: {str(e)}"
             }
     
     def get_model_history(self, max_records: int = 10) -> list:
