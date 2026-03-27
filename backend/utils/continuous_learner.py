@@ -282,6 +282,24 @@ class ContinuousLearner:
             print("\n[Step 2] Loading accumulated feedback...")
             X_feedback, y_feedback = self._get_feedback_data()
             
+            # VALIDATION: Ensure minimum sample threshold (lower for DEMO_MODE, 20 for production)
+            import os
+            is_demo_mode = os.getenv('DEMO_MODE', '').lower() == 'true'
+            MIN_FEEDBACK_SAMPLES = 5 if is_demo_mode else 20
+            
+            if len(X_feedback) < MIN_FEEDBACK_SAMPLES:
+                mode_label = "[DEMO MODE]" if is_demo_mode else "[PRODUCTION]"
+                print(f"✗ Insufficient feedback data to retrain: {len(X_feedback)} samples (need {MIN_FEEDBACK_SAMPLES}) {mode_label}")
+                return {
+                    "success": False,
+                    "promoted": False,
+                    "error": f"Insufficient samples: {len(X_feedback)}/{MIN_FEEDBACK_SAMPLES}",
+                    "cv_score": 0.0,
+                    "feedback_count": len(X_feedback),
+                    "total_samples": len(X_orig) if 'X_orig' in locals() else 0,
+                    "validation_reason": "Below minimum threshold for stable learning"
+                }
+            
             if not X_feedback:
                 print("✗ No feedback data to retrain on. Skipping retrain.")
                 return {

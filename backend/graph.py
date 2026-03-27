@@ -913,12 +913,16 @@ def execute_run(run_id: str) -> None:
                 feedback_db = FeedbackDB()
                 feedback_count = feedback_db.count()
                 
-                # Auto-retrain: after 1st feedback, then every 5 feedbacks
-                # This allows early model improvement instead of waiting for 20
-                should_retrain = (feedback_count == 1) or (feedback_count >= 5 and feedback_count % 5 == 0)
+                # Auto-retrain: after collecting 20 quality-gated feedback samples (batch-based learning)
+                # This ensures stable training signal and prevents noise-driven improvements
+                # Demo mode: lower threshold to 5 for demonstration purposes
+                import os
+                is_demo_mode = os.getenv('DEMO_MODE', '').lower() == 'true'
+                retrain_threshold = 5 if is_demo_mode else 20
+                should_retrain = feedback_count >= retrain_threshold and feedback_count % retrain_threshold == 0
                 
                 if should_retrain:
-                    print(f"\n[graph] Feedback count: {feedback_count} - triggering auto-retrain...")
+                    print(f"\n[graph] Feedback count: {feedback_count} - triggering batch-based auto-retrain...")
                     learner = ContinuousLearner()
                     result = learner.retrain()
                     

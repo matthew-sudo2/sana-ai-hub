@@ -32,6 +32,7 @@ class FeedbackDB:
                 predicted_score REAL NOT NULL,
                 actual_label INTEGER NOT NULL,
                 features TEXT NOT NULL,
+                is_quality_gated INTEGER DEFAULT 1,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -47,6 +48,11 @@ class FeedbackDB:
         except sqlite3.OperationalError:
             pass
         
+        try:
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_feedback_hash_label ON feedback(dataset_hash, actual_label)")
+        except sqlite3.OperationalError:
+            pass
+        
         conn.commit()
         conn.close()
         print(f"✓ Feedback database initialized: {self.db_path}")
@@ -56,7 +62,8 @@ class FeedbackDB:
         dataset_hash: str,
         predicted_score: float,
         actual_label: int,
-        features: List[float]
+        features: List[float],
+        is_quality_gated: bool = True
     ) -> bool:
         """
         Save feedback record with extracted features.
@@ -66,6 +73,7 @@ class FeedbackDB:
             predicted_score: Model's quality prediction (0-100)
             actual_label: User feedback (0=poor, 1=fair, 2=good, 3=excellent)
             features: List of 8 extracted features from MLQualityScorer
+            is_quality_gated: Whether feedback passed quality gate (True=accepted, False=rejected)
         
         Returns:
             True if saved successfully, False otherwise
@@ -81,9 +89,10 @@ class FeedbackDB:
                     dataset_hash,
                     predicted_score,
                     actual_label,
-                    features
-                ) VALUES (?, ?, ?, ?)
-            """, (dataset_hash, predicted_score, actual_label, features_json))
+                    features,
+                    is_quality_gated
+                ) VALUES (?, ?, ?, ?, ?)
+            """, (dataset_hash, predicted_score, actual_label, features_json, 1 if is_quality_gated else 0))
             
             conn.commit()
             conn.close()
@@ -206,3 +215,66 @@ class FeedbackDB:
             print(f"[feedback_db] ✓ Using {len(features_list)} valid feedback samples for retraining")
         
         return features_list, labels_list
+    
+    @staticmethod
+    def should_accept_feedback(predicted_score: float, actual_label: int) -> Tuple[bool, str]:
+        """
+        Quality gate: determine if feedback provides useful signal for retraining.
+        Only accept feedback where model prediction significantly contradicts actual label.
+        
+        Args:
+            predicted_score: Model's quality prediction (0-100)
+            actual_label: User feedback (0=poor, 1=fair, 2=good, 3=excellent)
+        
+        Returns:
+            Tuple of (should_accept: bool, reason: str)
+        
+        Logic:
+        - ACCEPT: Bad data (label=0) + high prediction (>70) → model overconfident
+        - ACCEPT: Good data (label>=2) + low prediction (<50) → model underconfident
+        - REJECT: Neutral data (label=1) at any prediction → weak signal
+        - REJECT: Model already confident in correct direction → already good
+        """
+        # Convert label to binary: 0-1=bad(0), 2-3=good(1)
+        is_good = actual_label >= 2
+        is_bad = actual_label == 0
+        is_neutral = actual_label == 1
+        
+        # Reject neutral labels - low info value
+        if is_neutral:
+            return False, "Neutral feedback (fair) has low signal value. Use poor/good/excellent."
+        
+        # Good data + low prediction = useful (model underestimated)
+        if is_good and predicted_score < 50:
+            return True, "High-value feedback: good data but model predicted low score"
+        
+        # Bad data + high prediction = useful (model overestimated)
+        if is_bad and predicted_score > 70:
+            return True, "High-value feedback: poor data but model predicted high score"
+        
+        # All other cases: model was already correct or close
+        return False, "Feedback aligns with model prediction. Choose datasets where model struggles."
+    
+    def get_feedback_per_dataset(self) -> dict[str, int]:
+        """
+        Get count of accepted feedback samples per dataset.
+        Used to detect if users are drilling the same dataset repeatedly.
+        
+        Returns:
+            Dictionary mapping dataset_hash → count of quality-gated feedback samples
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            rows = cursor.execute(
+                "SELECT dataset_hash, COUNT(*) FROM feedback WHERE is_quality_gated=1 GROUP BY dataset_hash"
+            ).fetchall()
+            
+            conn.close()
+            
+            result = {hash_val: count for hash_val, count in rows}
+            return result
+        except Exception as e:
+            print(f"✗ Error getting per-dataset feedback counts: {e}")
+            return {}

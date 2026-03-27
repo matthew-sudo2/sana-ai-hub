@@ -145,7 +145,7 @@ class FeedbackRequest(BaseModel):
 
 
 class FeedbackResponse(BaseModel):
-    status: str  # "stored" or "retrained"
+    status: str  # "stored", "retrained", or "rejected"
     feedback_count: int
     cv_score: float | None = None  # Current cv score after retraining
     previous_cv_score: float | None = None  # Previous cv score
@@ -1388,7 +1388,8 @@ async def record_feedback(request: FeedbackRequest) -> FeedbackResponse:
     User provides feedback on whether the quality score was accurate.
     Features are extracted during validation and stored for retraining.
     
-    Auto-retrains every 20 feedback samples.
+    Auto-retrains every 20 feedback samples using batch adaptive learning.
+    Includes quality-gating (only high-value feedback) and duplicate dataset prevention.
     
     Args:
         dataset_hash: MD5 hash of the dataset (for deduplication)
@@ -1402,29 +1403,61 @@ async def record_feedback(request: FeedbackRequest) -> FeedbackResponse:
     try:
         feedback_db = FeedbackDB()
         
-        # Store feedback
+        # Step 1: Quality-gate the feedback
+        should_accept, gate_reason = FeedbackDB.should_accept_feedback(
+            predicted_score=request.predicted_score,
+            actual_label=request.actual_quality
+        )
+        
+        if not should_accept:
+            print(f"[API] ⚠️ Feedback rejected by quality gate: {gate_reason}")
+            return FeedbackResponse(
+                status="rejected",
+                feedback_count=feedback_db.count(),
+                message=f"❌ {gate_reason}"
+            )
+        
+        # Step 2: Check for duplicate dataset drilling (max 3 feedback per dataset)
+        feedback_per_dataset = feedback_db.get_feedback_per_dataset()
+        existing_count = feedback_per_dataset.get(request.dataset_hash, 0)
+        
+        if existing_count >= 3:
+            print(f"[API] ⚠️ Dataset already has {existing_count} feedback samples. Preventing duplicate drilling.")
+            return FeedbackResponse(
+                status="rejected",
+                feedback_count=feedback_db.count(),
+                message=f"❌ We already have {existing_count} feedback samples from this dataset. Please test on a different dataset to improve model diversity. Available columns analysis preferred over re-testing same data."
+            )
+        
+        # Step 3: Store feedback (passed quality gate and duplicate check)
         feedback_db.save(
             dataset_hash=request.dataset_hash,
             predicted_score=request.predicted_score,
             actual_label=request.actual_quality,
-            features=request.features or []
+            features=request.features or [],
+            is_quality_gated=True
         )
         
         count = feedback_db.count()
         
-        # Check if it's time to retrain: after 1st feedback, then every 5 feedbacks
-        should_retrain = (count == 1) or (count >= 5 and count % 5 == 0)
+        # Step 4: Check if it's time to retrain (after 20 quality-gated feedback samples)
+        # Only retrain at count=20, 40, 60, etc. (batch-based, not per-feedback)
+        # Demo mode: lower threshold to 5 for demonstration purposes
+        import os
+        is_demo_mode = os.getenv('DEMO_MODE', '').lower() == 'true'
+        retrain_threshold = 5 if is_demo_mode else 20
+        should_retrain = count >= retrain_threshold and count % retrain_threshold == 0
         
         if should_retrain:
-            print(f"\n[API] Feedback count: {count} - triggering auto-retrain...")
+            print(f"\n[API] Feedback count: {count} - triggering batch-based retrain...")
             
             try:
                 learner = ContinuousLearner()
                 result = learner.retrain()
                 
                 if result["success"]:
-                    # Clean old feedback records after successful retrain (keep last 100)
-                    deleted = feedback_db.clear_feedback(keep_last=100)
+                    # Clean old feedback records after successful retrain (keep last 500)
+                    deleted = feedback_db.clear_feedback(keep_last=500)
                     if deleted > 0:
                         print(f"[API] Cleaned {deleted} old feedback records after retrain")
                     
@@ -1454,10 +1487,10 @@ async def record_feedback(request: FeedbackRequest) -> FeedbackResponse:
                         previous_cv_score=previous_cv_score,
                         improvement=improvement_pct,
                         model_version=model_version,
-                        message="✓ Thank you! Your feedback helps us improve our quality assessments."
+                        message=f"✓ Thank you! Your feedback helped improve our model. Retrained on {retrain_threshold} quality samples."
                     )
                 else:
-                    next_retrain = 5 if count == 1 else (5 - (count % 5))
+                    next_retrain = retrain_threshold - (count % retrain_threshold)
                     return FeedbackResponse(
                         status="stored",
                         feedback_count=count,
@@ -1466,27 +1499,22 @@ async def record_feedback(request: FeedbackRequest) -> FeedbackResponse:
                     )
             except Exception as e:
                 print(f"[API] Retrain error: {e}")
-                next_retrain = 5 if count == 1 else (5 - (count % 5))
+                next_retrain = retrain_threshold - (count % retrain_threshold)
                 return FeedbackResponse(
                     status="stored",
                     feedback_count=count,
-                    message=f"Feedback stored. Retrain failed: {str(e)}",
+                    message=f"Feedback stored. Retrain failed: {str(e)}. Next retrain in {next_retrain} samples.",
                     next_retrain_at=next_retrain
                 )
         
         # Not time to retrain yet - calculate feedbacks remaining
-        if count == 0:
-            next_retrain = 1
-        elif count == 1:
-            next_retrain = 4  # Next retrain at count=5
-        else:
-            next_retrain = 5 - (count % 5)
+        next_retrain = retrain_threshold - (count % retrain_threshold)
         
         return FeedbackResponse(
             status="stored",
             feedback_count=count,
             next_retrain_at=next_retrain,
-            message=f"✓ Feedback stored. {next_retrain} more feedbacks until next retrain."
+            message=f"✓ Quality feedback stored ({existing_count + 1}/3 for this dataset). {next_retrain} more quality feedbacks until retrain."
         )
     
     except Exception as e:
