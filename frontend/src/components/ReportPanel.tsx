@@ -3,10 +3,14 @@ import { usePipeline } from "@/context/PipelineContext";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useToast } from "@/hooks/use-toast";
+import { useRef } from "react";
+import html2canvas from "html2canvas";
+import { jsPDF } from "jspdf";
 
 const ReportPanel = () => {
   const { reportContent, isLoading, phase, runId } = usePipeline();
   const { toast } = useToast();
+  const reportRef = useRef<HTMLDivElement>(null);
 
   /**
    * Sanitize report content by removing or escaping problematic characters
@@ -43,18 +47,70 @@ const ReportPanel = () => {
     }
   };
 
-  const handleExport = () => {
-    if (reportContent) {
-      const element = document.createElement("a");
-      const file = new Blob([reportContent], { type: "text/markdown" });
-      element.href = URL.createObjectURL(file);
-      element.download = `report-${runId || "export"}.md`;
-      document.body.appendChild(element);
-      element.click();
-      document.body.removeChild(element);
+  const handleExport = async () => {
+    if (!reportRef.current) {
+      toast({
+        title: "Error",
+        description: "Report content not available",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    try {
+      toast({
+        title: "Generating PDF",
+        description: "Please wait while we create your report...",
+      });
+
+      // Capture the report content as canvas
+      const canvas = await html2canvas(reportRef.current, {
+        scale: 2,
+        useCORS: true,
+        logging: false,
+        backgroundColor: "#ffffff",
+      });
+
+      // Create PDF from canvas
+      const imgData = canvas.toDataURL("image/png");
+      const pdf = new jsPDF({
+        orientation: "portrait",
+        unit: "mm",
+        format: "a4",
+      });
+
+      const pdfWidth = pdf.internal.pageSize.getWidth();
+      const pdfHeight = pdf.internal.pageSize.getHeight();
+      const imgWidth = pdfWidth - 20; // 10mm margins
+      const imgHeight = (canvas.height * imgWidth) / canvas.width;
+
+      let heightLeft = imgHeight;
+      let position = 10; // 10mm top margin
+
+      // Add image to PDF, creating new pages as needed
+      pdf.addImage(imgData, "PNG", 10, position, imgWidth, imgHeight);
+      heightLeft -= pdfHeight - 20; // Account for margins
+
+      while (heightLeft > 0) {
+        position = heightLeft - imgHeight;
+        pdf.addPage();
+        pdf.addImage(imgData, "PNG", 10, position, imgWidth, imgHeight);
+        heightLeft -= pdfHeight - 20;
+      }
+
+      // Save PDF
+      pdf.save(`validation-report-${runId || "export"}.pdf`);
+
       toast({
         title: "Downloaded",
-        description: "Report exported as Markdown",
+        description: "Report exported as PDF",
+      });
+    } catch (error) {
+      console.error("PDF generation error:", error);
+      toast({
+        title: "Error",
+        description: "Failed to generate PDF. Please try again.",
+        variant: "destructive",
       });
     }
   };
@@ -108,7 +164,7 @@ const ReportPanel = () => {
                 </div>
               </div>
               
-              <div className="rounded-lg border bg-card shadow-sm prose prose-sm dark:prose-invert max-w-none">
+              <div className="rounded-lg border bg-card shadow-sm prose prose-sm dark:prose-invert max-w-none" ref={reportRef}>
                 <div className="p-6">
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}

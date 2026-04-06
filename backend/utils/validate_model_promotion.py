@@ -220,25 +220,37 @@ class ModelPromotionValidator:
         print(f"  Balanced Accuracy: {current_balanced_acc:.4f} → {candidate_balanced_acc:.4f} (Δ {balanced_acc_improvement:+.4f})")
         print(f"  AUC-ROC:           {current_auc:.4f} → {candidate_auc:.4f} (Δ {auc_improvement:+.4f})")
         
-        # Decision logic: Promote if F1 score improves OR balanced accuracy improves
-        # with a small tolerance for noise
-        IMPROVEMENT_THRESHOLD = 0.001  # 0.1% improvement required
+        # Decision logic: Promote ONLY if meaningful improvement on multiple metrics
+        # Fail-safe: default to keeping current model if any metric degrades
+        IMPROVEMENT_THRESHOLD = 0.02  # 2% improvement required (not 0.1%!)
+        DEGRADATION_PENALTY = -0.01   # Any metric that drops 1%+ is suspicious
         
         promoted = False
         reason = ""
         
-        if f1_improvement > IMPROVEMENT_THRESHOLD:
+        # Count metrics that improved vs degraded
+        metrics_improved = sum([
+            f1_improvement > IMPROVEMENT_THRESHOLD,
+            balanced_acc_improvement > IMPROVEMENT_THRESHOLD,
+            auc_improvement > IMPROVEMENT_THRESHOLD
+        ])
+        
+        metrics_degraded = sum([
+            f1_improvement < DEGRADATION_PENALTY,
+            balanced_acc_improvement < DEGRADATION_PENALTY,
+            auc_improvement < DEGRADATION_PENALTY
+        ])
+        
+        # Strict logic: promote only if ≥2 metrics improve significantly AND none degrade
+        if metrics_improved >= 2 and metrics_degraded == 0:
             promoted = True
-            reason = f"F1 score improved by {f1_improvement:.4f}"
-        elif balanced_acc_improvement > IMPROVEMENT_THRESHOLD:
-            promoted = True
-            reason = f"Balanced accuracy improved by {balanced_acc_improvement:.4f}"
-        elif auc_improvement > IMPROVEMENT_THRESHOLD:
-            promoted = True
-            reason = f"AUC-ROC improved by {auc_improvement:.4f}"
+            reason = f"Meaningful improvement: F1 +{f1_improvement:.2%}, Bal.Acc +{balanced_acc_improvement:.2%}, AUC +{auc_improvement:.2%}"
+        elif metrics_degraded > 0:
+            promoted = False
+            reason = f"Degradation detected: Some metrics worse. F1 {f1_improvement:+.2%}, Bal.Acc {balanced_acc_improvement:+.2%}, AUC {auc_improvement:+.2%}"
         else:
             promoted = False
-            reason = "No meaningful improvement detected"
+            reason = f"Insufficient improvement ({metrics_improved}/3 metrics met threshold). Cannot risk production quality."
         
         print(f"\n{'='*80}")
         if promoted:

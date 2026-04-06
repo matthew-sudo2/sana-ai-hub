@@ -18,9 +18,13 @@ def _taskkill(pid: int) -> None:
             ["taskkill", "/PID", str(pid), "/T", "/F"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=5,
+            timeout=10,
         )
+    except subprocess.TimeoutExpired:
+        # taskkill took too long but process may still be killed
+        pass
     except Exception:
+        # Process already terminated or taskkill not found
         pass
 
 
