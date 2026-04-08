@@ -173,6 +173,46 @@ def _plot_pie(df: pd.DataFrame, col: str, out: Path, top_n: int = 8) -> ChartRec
                        png_path=str(out), generated_by="builtin")
 
 
+def _plot_grouped_bar(
+    df: pd.DataFrame, cat_col: str, num_col: str, out: Path, top_n: int = 10
+) -> ChartRecord:
+    """Grouped bar chart: mean of a numeric column broken down by a categorical column.
+    Shows how a numeric metric varies across categorical groups."""
+    # Get top N categories by frequency to avoid clutter
+    top_cats = df[cat_col].value_counts().head(top_n).index
+    filtered = df[df[cat_col].isin(top_cats)].copy()
+    
+    grouped = filtered.groupby(cat_col)[num_col].agg(['mean', 'std', 'count']).reindex(top_cats)
+    
+    fig, ax = plt.subplots(figsize=(max(8, len(grouped) * 0.8), 5))
+    bars = ax.bar(
+        range(len(grouped)), grouped['mean'].values,
+        color=sns.color_palette("viridis", len(grouped)),
+        edgecolor="white", linewidth=0.5
+    )
+    
+    # Add count labels on top of bars
+    for i, (mean_val, count) in enumerate(zip(grouped['mean'].values, grouped['count'].values)):
+        ax.annotate(
+            f"n={int(count)}",
+            (i, mean_val), ha="center", va="bottom", fontsize=7, color="#666"
+        )
+    
+    ax.set_xticks(range(len(grouped)))
+    ax.set_xticklabels([str(x)[:20] for x in grouped.index], rotation=35, ha='right', fontsize=9)
+    ax.set_title(f"Mean {num_col} by {cat_col}")
+    ax.set_xlabel(cat_col)
+    ax.set_ylabel(f"Mean {num_col}")
+    _save_fig(fig, out)
+    return ChartRecord(
+        chart_id=f"grouped_{_safe_slug(cat_col)}_{_safe_slug(num_col)}",
+        chart_type="bar",
+        title=f"Mean {num_col} by {cat_col}",
+        columns_used=[cat_col, num_col],
+        png_path=str(out), generated_by="builtin",
+    )
+
+
 def _plot_line(df: pd.DataFrame, col: str, out: Path) -> ChartRecord:
     fig, ax = plt.subplots(figsize=(10, 4))
     series = df[col].dropna().reset_index(drop=True)
@@ -338,7 +378,7 @@ def _select_charts(
         charts.append(_plot_box(df, numeric_cols[:8], out))
 
     # ── 6. Categorical columns ───────────────────────────────────────────
-    for col in cat_cols[:4]:
+    for col in cat_cols[:6]:  # Increased cap from 4 to 6
         unique = df[col].nunique(dropna=True)
         if unique == 0:
             continue
@@ -351,6 +391,22 @@ def _select_charts(
             out = run_dir / f"bar_{_safe_slug(col)}.png"
             charts.append(_plot_bar(df, col, out))
         # High-cardinality categoricals skipped (not informative)
+
+    # ── 6b. Grouped bar: categorical vs numeric breakdown ──────────────
+    #   For each categorical column with 2–15 unique values,
+    #   show mean of first numeric column grouped by category
+    grouped_count = 0
+    for ccat in cat_cols:
+        unique = df[ccat].nunique(dropna=True)
+        if 2 <= unique <= 15 and numeric_cols and grouped_count < 3:
+            num_col = numeric_cols[0]  # Use first numeric column
+            out = run_dir / f"grouped_{_safe_slug(ccat)}_{_safe_slug(num_col)}.png"
+            try:
+                charts.append(_plot_grouped_bar(df, ccat, num_col, out))
+                grouped_count += 1
+            except Exception as e:
+                print(f"[artist] Warning: Failed to create grouped bar for {ccat} vs {num_col}: {e}")
+                continue
 
     # ── 7. Datetime columns → line chart using first numeric col ─────────
     for dt_col in datetime_cols[:2]:

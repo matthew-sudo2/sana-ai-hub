@@ -34,20 +34,26 @@ def main() -> int:
     if state is None:
         raise RuntimeError("Pipeline state not found after execution")
 
+    # Handle both dict and object returns from get_run()
+    def _get(obj, key, default=None):
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
     output = {
-        "run_id": state.run_id,
-        "phase": state.phase,
-        "status": state.status,
-        "error": state.error,
-        "run_dir": state.run_dir,
-        "scout_output_dir": state.scout_output_dir,
-        "labeler_output_dir": state.labeler_output_dir,
-        "analyst_output_dir": state.analyst_output_dir,
-        "artist_output_dir": state.artist_output_dir,
-        "validator_output_dir": state.validator_output_dir,
+        "run_id": _get(state, "run_id"),
+        "phase": _get(state, "phase"),
+        "status": _get(state, "status"),
+        "error": _get(state, "error"),
+        "run_dir": _get(state, "run_dir"),
+        "scout_output_dir": _get(state, "scout_output_dir"),
+        "labeler_output_dir": _get(state, "labeler_output_dir"),
+        "analyst_output_dir": _get(state, "analyst_output_dir"),
+        "artist_output_dir": _get(state, "artist_output_dir"),
+        "validator_output_dir": _get(state, "validator_output_dir"),
     }
     print(json.dumps(output, ensure_ascii=False, indent=2))
-    return 0 if state.status == "success" else 1
+    return 0 if _get(state, "status") == "success" else 1
 
 
 if __name__ == "__main__":

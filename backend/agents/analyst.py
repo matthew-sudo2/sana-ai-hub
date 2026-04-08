@@ -74,6 +74,11 @@ class CategoricalInsight(BaseModel):
     column: str
     unique_count: int
     top_values: list[dict[str, Any]]   # [{"value": x, "count": n, "pct": p}, …]
+    class_imbalance_ratio: float = 0.0  # ratio of most-frequent to least-frequent class
+    avg_text_length: float | None = None  # average string length
+    min_text_length: int | None = None
+    max_text_length: int | None = None
+    cardinality_ratio: float = 0.0  # unique_count / total_rows  (1.0 = all unique)
 
 
 class Anomaly(BaseModel):
@@ -362,10 +367,35 @@ def _compute_categorical_insights(df: pd.DataFrame, top_n: int = 10) -> list[Cat
             {"value": str(v), "count": int(c), "pct": round(c / total * 100, 2)}
             for v, c in vc.head(top_n).items()
         ]
+        
+        unique_count = int(df[col].nunique(dropna=True))
+        
+        # Class imbalance: ratio of most frequent vs least frequent class
+        class_imbalance = 0.0
+        if len(vc) >= 2:
+            # Filter out NaN counts for imbalance calculation
+            vc_clean = vc.dropna()
+            if len(vc_clean) >= 2:
+                class_imbalance = round(float(vc_clean.iloc[0]) / max(float(vc_clean.iloc[-1]), 1), 2)
+        
+        # Text length statistics
+        text_series = df[col].dropna().astype(str)
+        avg_len = round(float(text_series.str.len().mean()), 1) if len(text_series) > 0 else None
+        min_len = int(text_series.str.len().min()) if len(text_series) > 0 else None
+        max_len = int(text_series.str.len().max()) if len(text_series) > 0 else None
+        
+        # Cardinality ratio
+        cardinality_ratio = round(unique_count / total, 4) if total > 0 else 0.0
+        
         insights.append(CategoricalInsight(
             column=col,
-            unique_count=int(df[col].nunique(dropna=True)),
+            unique_count=unique_count,
             top_values=top,
+            class_imbalance_ratio=class_imbalance,
+            avg_text_length=avg_len,
+            min_text_length=min_len,
+            max_text_length=max_len,
+            cardinality_ratio=cardinality_ratio,
         ))
     return insights
 
@@ -442,6 +472,25 @@ def _derive_key_insights(
 
     if not insights:
         insights.append("No strong patterns detected — data appears uniformly distributed.")
+
+    # Categorical dominance & class imbalance (NEW)
+    cat_insights_input = []
+    # We'll derive these from the df directly since we have it
+    cat_cols_direct = df.select_dtypes(exclude=[np.number]).columns
+    for col in cat_cols_direct:
+        vc = df[col].value_counts(dropna=True)
+        if len(vc) >= 2:
+            top_class = vc.index[0]
+            top_pct = round(vc.iloc[0] / len(df) * 100, 1)
+            imbalance = round(float(vc.iloc[0]) / max(float(vc.iloc[-1]), 1), 2)
+            if top_pct > 50:
+                insights.append(
+                    f"Dominant category in `{col}`: '{top_class}' represents {top_pct}% of all records."
+                )
+            if imbalance > 10:
+                insights.append(
+                    f"Severe class imbalance in `{col}`: most-frequent class is {imbalance}x more common than the rarest."
+                )
 
     return insights
 
@@ -669,6 +718,14 @@ def _build_markdown_report(result: AnalysisResult) -> str:
         lines += ["", "---", "", "## Categorical Columns", ""]
         for ci in result.categorical_insights:
             lines.append(f"### `{ci.column}` ({ci.unique_count} unique values)")
+            # Show enhanced metrics
+            if ci.cardinality_ratio > 0:
+                lines.append(f"**Cardinality ratio:** {ci.cardinality_ratio:.2%}")
+            if ci.class_imbalance_ratio > 1:
+                lines.append(f"**Class imbalance:** {ci.class_imbalance_ratio:.1f}x (most vs least frequent)")
+            if ci.avg_text_length is not None:
+                lines.append(f"**Text length:** avg={ci.avg_text_length}, min={ci.min_text_length}, max={ci.max_text_length}")
+            lines.append("")
             lines.append("| Value | Count | % |")
             lines.append("|-------|-------|---|")
             for tv in ci.top_values[:5]:
